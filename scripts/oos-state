@@ -1,0 +1,14 @@
+#!/bin/zsh
+set -euo pipefail
+REPO_ROOT="${0:A:h:h}"
+if [[ -n "${HERO_OOS_CLI:-}" ]]; then
+  BINARY="$HERO_OOS_CLI"
+else
+  BINARY=""
+  for candidate in "$REPO_ROOT/native/.build/release/oos-state" "$REPO_ROOT/native/.build/debug/oos-state" "$HOME/Applications/Hero OOS.app/Contents/MacOS/oos-state" "/Applications/Hero OOS.app/Contents/MacOS/oos-state"; do
+    if [[ -x "$candidate" ]]; then BINARY="$candidate"; break; fi
+  done
+fi
+[[ -n "$BINARY" && -x "$BINARY" ]] || { print -u2 'Build native/ first, install Hero OOS, or set HERO_OOS_CLI to the CLI executable.'; exit 1; }
+export HERO_OOS_ROOT="${HERO_OOS_ROOT:-$HOME/Library/Application Support/Hero OOS/local}"
+exec "$BINARY" "$@"

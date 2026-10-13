@@ -1,0 +1,7 @@
+interface:
+  display_name: "Hero OOS"
+  short_description: "操作本地 Hero OOS 任务、日程与 Current Truth"
+  brand_color: "#58BFC3"
+  default_prompt: "Use $hero-oos to show my Current Truth and update the relevant task."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,32 @@
+[Unit]
+Description=Hero OOS private task and organization service
+After=network.target
+
+[Service]
+Type=simple
+User=hero-oos
+Group=hero-oos
+WorkingDirectory=/opt/hero-oos
+ExecStart=/opt/hero-oos/venv/bin/python /opt/hero-oos/server.py --config /etc/hero-oos/config.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hero-oos
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=384M
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

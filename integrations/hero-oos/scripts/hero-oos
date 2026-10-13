@@ -1,0 +1,11 @@
+#!/bin/zsh
+set -euo pipefail
+REPO_ROOT="${HERO_OOS_REPO:-${0:A:h:h:h:h}}"
+if [[ -x "$REPO_ROOT/scripts/oos-state" ]]; then
+  exec "$REPO_ROOT/scripts/oos-state" "$@"
+fi
+BINARY="${HERO_OOS_CLI:-$HOME/Applications/Hero OOS.app/Contents/MacOS/oos-state}"
+if [[ -z "${HERO_OOS_CLI:-}" && ! -x "$BINARY" ]]; then BINARY='/Applications/Hero OOS.app/Contents/MacOS/oos-state'; fi
+[[ -x "$BINARY" ]] || { print -u2 'Set HERO_OOS_REPO to the source checkout or HERO_OOS_CLI to the CLI executable.'; exit 1; }
+export HERO_OOS_ROOT="${HERO_OOS_ROOT:-$HOME/Library/Application Support/Hero OOS/local}"
+exec "$BINARY" "$@"
