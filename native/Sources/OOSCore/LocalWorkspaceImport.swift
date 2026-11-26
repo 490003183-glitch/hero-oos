@@ -24,7 +24,7 @@ public enum LocalWorkspaceImport {
         }
         let original: (JSON, JSON) = try source.locked {
             let state = try source.readJSON(source.file("state.json"))
-            let collages = try source.readJSON(source.file("collages.json"), fallback: StateRuntime.defaultCollages)
+            let collages = try source.readJSON(source.collageFile("collages.json"), fallback: StateRuntime.defaultCollages)
             try validateCollageDocument(collages)
             return (state, source.normalizeCollages(collages))
         }
@@ -42,7 +42,7 @@ public enum LocalWorkspaceImport {
             throw failure("state_conflict", "目标工作区已变化，请读取最新版本后重试。")
         }
         let beforeCollages: JSON = try destination.locked {
-            let raw = try destination.readJSON(destination.file("collages.json"), fallback: StateRuntime.defaultCollages)
+            let raw = try destination.readJSON(destination.collageFile("collages.json"), fallback: StateRuntime.defaultCollages)
             try validateCollageDocument(raw)
             return destination.normalizeCollages(raw)
         }
@@ -71,7 +71,7 @@ public enum LocalWorkspaceImport {
         try FileManager.default.createDirectory(at: backup, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try writePrivate(before, to: backup.appendingPathComponent("state.json"), runtime: destination)
         try writePrivate(beforeCollages, to: backup.appendingPathComponent("collages.json"), runtime: destination)
-        try FileManager.default.createDirectory(at: destination.file("collage-assets"), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: destination.collageFile("collage-assets"), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         for asset in assets { try copy(asset, to: destination) }
 
         // Collage CAS and task CAS retain concurrent edits. Partial success is never rolled back over
@@ -196,7 +196,7 @@ public enum LocalWorkspaceImport {
             let url = try source.assetURL(name)
             // The runtime's URL containment check expects the asset directory to exist. During
             // preflight an empty account may have no directory yet; do not create it just to read.
-            let target = FileManager.default.fileExists(atPath: destination.file("collage-assets").path) ? try destination.assetURL(name) : nil
+            let target = FileManager.default.fileExists(atPath: try destination.collageFile("collage-assets").path) ? try destination.assetURL(name) : nil
             let values = try url.resourceValues(forKeys: [.isRegularFileKey])
             guard values.isRegularFile == true else { throw failure("missing_asset", "原拼图引用的图片文件不存在或无效。") }
             let data = try Data(contentsOf: url), digest = SHA256.hash(data: data)

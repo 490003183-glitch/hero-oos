@@ -23,13 +23,17 @@ import SwiftUI
     private var generation = 0
     private var initialized = false
     private var localChanges: AnyCancellable?
+    private var events: CloudTaskEventStream?
+    private let eventTransport: any ServerEventTransport
     private let makeStores: @MainActor (URL) -> (OOSStore, CollageStore)
 
     init(localRoot: URL = OOSAPI().base,
          accountsRoot: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Hero OOS/accounts", isDirectory: true),
-         makeStores: (@MainActor (URL) -> (OOSStore, CollageStore))? = nil) {
+         makeStores: (@MainActor (URL) -> (OOSStore, CollageStore))? = nil,
+         eventTransport: (any ServerEventTransport)? = nil) {
         self.localRoot = localRoot; self.accountsRoot = accountsRoot
+        self.eventTransport = eventTransport ?? URLSessionServerEventTransport()
         self.makeStores = makeStores ?? { root in
             let api = OOSAPI(base: root); return (OOSStore(api: api), CollageStore(api: api))
         }
@@ -58,11 +62,15 @@ import SwiftUI
             error = "已返回原工作区。未保存的编辑仍在，请先修正或核对冲突，再切换账号。"
             await store.start()
             observeLocalChanges()
-            if currentGeneration == generation, account.identityKey == requested { await sync?.start(); await personalSync?.start() }
+            if currentGeneration == generation, account.identityKey == requested {
+                await sync?.start(); await personalSync?.start()
+                startEvents(account: account)
+            }
             return
         }
         ready = false; switching = true; error = nil
         localChanges = nil
+        events?.stop(); events = nil
         sync?.stop()
         personalSync?.stop()
         defer { if generation == currentGeneration { switching = false } }
@@ -133,6 +141,7 @@ import SwiftUI
                 async let organizationStart: Void = nextSync.start()
                 async let personalStart: Void = nextPersonalSync.start()
                 _ = await (organizationStart, personalStart)
+                if currentGeneration == generation, account.identityKey == requested { startEvents(account: account) }
             } else {
                 await localStore.start(); await localCollage.load()
                 guard currentGeneration == generation, account.session == nil else { localStore.stop(); return }
@@ -149,8 +158,24 @@ import SwiftUI
         localChanges = store.$state.map { $0["meta"]["version"].number }
             .removeDuplicates().debounce(for: .milliseconds(150), scheduler: RunLoop.main)
             .sink { [weak organizationSync, weak ownerSync] _ in
-                Task { await organizationSync?.refreshLocalStatus(); await ownerSync?.refreshLocalStatus() }
+                Task { await organizationSync?.localDidChange(); await ownerSync?.localDidChange() }
             }
+    }
+
+    private func startEvents(account: CloudAccount) {
+        events?.stop()
+        guard isCloudAccount, activeIdentity == account.identityKey, let sync, let personalSync else { events = nil; return }
+        let stream = CloudTaskEventStream(account: account, transport: eventTransport,
+            onState: { [weak sync, weak personalSync] state, first in
+                Task {
+                    await sync?.serverChanged(revision: state.organizationRevision, reconnected: first)
+                    await personalSync?.serverChanged(revision: state.personalRevision, reconnected: first)
+                }
+            }, onConnection: { [weak sync, weak personalSync] connected, error in
+                sync?.pushConnectionChanged(connected: connected, error: error)
+                personalSync?.pushConnectionChanged(connected: connected, error: error)
+            })
+        events = stream; stream.start()
     }
 
     static func requestedLocalImport(identity: String, arguments: [String]) -> Bool {
@@ -169,6 +194,7 @@ import SwiftUI
         let currentPersonalSync = personalSync
         currentSync?.stop()
         currentPersonalSync?.stop()
+        events?.stop(); events = nil
         defer { importing = false }
         do {
             guard !collage.importing, !localCollage.importing,
@@ -188,7 +214,10 @@ import SwiftUI
             importedLocalTasks = true
             await store.refresh(); await collage.load()
         } catch { self.error = error.localizedDescription }
-        if activeIdentity == identity, account.identityKey == identity { await currentSync?.start(); await currentPersonalSync?.start() }
+        if activeIdentity == identity, account.identityKey == identity {
+            await currentSync?.start(); await currentPersonalSync?.start()
+            startEvents(account: account)
+        }
     }
 
     static func restoreGraphLayout(from sourceIdentity: String, to destinationIdentity: String,

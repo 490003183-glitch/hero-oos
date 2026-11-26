@@ -59,25 +59,25 @@ import Combine
     func testTimePeopleSearchAndReadinessFiltersIntersectWithoutTreatingOtherBlocksAsTime() {
         let future = RuntimeDate.iso(now.addingTimeInterval(3600))
         let past = RuntimeDate.iso(now.addingTimeInterval(-3600))
-        var dependency = task("dependency", title: "示例甲 等前置", availableAt: past, person: "alice")
+        var dependency = task("dependency", title: "示例客户 等前置", availableAt: past, person: "alice")
         dependency["dependsOn"] = ["upstream"]
-        let source = [task("future", title: "示例甲 未到时间", availableAt: future, person: " ALICE "),
-                      task("person", title: "示例甲 等回复", availableAt: past, person: "alice"), dependency,
-                      task("other-person", title: "示例甲 其他人", person: "other"),
-                      task("other-search", title: "示例乙 等回复", person: "alice"),
-                      task("available", title: "示例甲 可以开始", availableAt: past), task("upstream")]
+        let source = [task("future", title: "示例客户 未到时间", availableAt: future, person: " ALICE "),
+                      task("person", title: "示例客户 等回复", availableAt: past, person: "alice"), dependency,
+                      task("other-person", title: "示例客户 其他人", person: "other"),
+                      task("other-search", title: "示例项目 等回复", person: "alice"),
+                      task("available", title: "示例客户 可以开始", availableAt: past), task("upstream")]
         let graph = TaskGraphModel(); graph.reconcile(source)
         graph.timeFilter = .hideUpcoming; graph.personFilter = .person("alice")
 
-        XCTAssertEqual(ids(graph, query: "示例甲"), ["person", "dependency"])
+        XCTAssertEqual(ids(graph, query: "示例客户"), ["person", "dependency"])
         graph.filter = .blocked
-        XCTAssertEqual(ids(graph, query: "示例甲"), ["person", "dependency"])
+        XCTAssertEqual(ids(graph, query: "示例客户"), ["person", "dependency"])
         graph.filter = .ready
-        XCTAssertTrue(ids(graph, query: "示例甲").isEmpty)
+        XCTAssertTrue(ids(graph, query: "示例客户").isEmpty)
         graph.personFilter = .none
-        XCTAssertEqual(ids(graph, query: "示例甲"), ["available"])
+        XCTAssertEqual(ids(graph, query: "示例客户"), ["available"])
         graph.timeFilter = .upcomingOnly; graph.personFilter = .all; graph.filter = .blocked
-        XCTAssertEqual(ids(graph, query: "示例甲"), ["future"])
+        XCTAssertEqual(ids(graph, query: "示例客户"), ["future"])
         XCTAssertTrue(ids(graph, query: "不存在").isEmpty)
     }
 
@@ -233,10 +233,10 @@ import Combine
     }
 
     func testDependencyAndNearbyArrangeOnlyMoveTasksPassingTimeFilter() {
-        let source = [task("shown", title: "示例甲 已到时间", availableAt: "2000-01-01T00:00:00Z", person: "alice"),
-                      task("future", title: "示例甲 未到时间", availableAt: "2099-01-01T00:00:00Z", person: "alice"),
-                      task("other-person", title: "示例甲 已到时间", person: "other"),
-                      task("other-search", title: "示例乙 已到时间", person: "alice")]
+        let source = [task("shown", title: "示例客户 已到时间", availableAt: "2000-01-01T00:00:00Z", person: "alice"),
+                      task("future", title: "示例客户 未到时间", availableAt: "2099-01-01T00:00:00Z", person: "alice"),
+                      task("other-person", title: "示例客户 已到时间", person: "other"),
+                      task("other-search", title: "示例项目 已到时间", person: "alice")]
         for nearby in [false, true] {
             let graph = TaskGraphModel(); graph.reconcile(source)
             for (index, item) in source.enumerated() {
@@ -245,7 +245,7 @@ import Combine
             graph.timeFilter = .hideUpcoming; graph.personFilter = .person("alice")
             let before = graph.layout
 
-            if nearby { graph.arrangeNearby(query: "示例甲") } else { graph.arrange(query: "示例甲") }
+            if nearby { graph.arrangeNearby(query: "示例客户") } else { graph.arrange(query: "示例客户") }
 
             XCTAssertNotEqual(graph.layout.positions["shown"], before.positions["shown"])
             for id in ["future", "other-person", "other-search"] {

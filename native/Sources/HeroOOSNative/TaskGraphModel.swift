@@ -76,9 +76,33 @@ struct TaskGraphViewState: Codable, Equatable {
 
 enum TaskGraphGeometry {
     static let size = CGSize(width: 284, height: 194)
+    static let snapGridSpacing = 24.0
     static let titleOnlyZoom = 0.45
     static let overviewZoom = 0.20
     static let titleScreenFontSize = 13.0
+    static func snappedPoint(_ point: CGPoint) -> CGPoint {
+        guard point.x.isFinite, point.y.isFinite else { return point }
+        return CGPoint(x: (point.x / snapGridSpacing).rounded() * snapGridSpacing,
+                       y: (point.y / snapGridSpacing).rounded() * snapGridSpacing)
+    }
+    /// Snap only the dragged group's anchor; one shared correction preserves
+    /// the spacing of a multi-selection and any collapsed descendants it carries.
+    /// Called on release, never while loading saved positions or moving the camera.
+    static func snappedPositions(_ positions: [String: GraphPoint], moving ids: Set<String>, anchor: String?) -> [String: GraphPoint] {
+        let available = ids.filter { positions[$0] != nil }
+        guard let reference = anchor.flatMap({ available.contains($0) ? $0 : nil }) ?? available.sorted().first,
+              let point = positions[reference]?.point else { return positions }
+        let target = snappedPoint(point)
+        guard target != point else { return positions }
+        let dx = target.x - point.x, dy = target.y - point.y
+        var result = positions
+        for id in available {
+            if let current = positions[id] {
+                result[id] = GraphPoint(CGPoint(x: current.x + dx, y: current.y + dy))
+            }
+        }
+        return result
+    }
     static func nodeRect(at point: CGPoint, zoom: Double) -> CGRect {
         if zoom <= titleOnlyZoom {
             // At everyday overview levels reserve two readable 13 pt lines.

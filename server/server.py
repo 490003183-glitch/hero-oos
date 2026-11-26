@@ -15,6 +15,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import time
 import unicodedata
 import uuid
@@ -31,7 +32,8 @@ from argon2.exceptions import VerificationError
 DOCUMENT_LIMIT = 8 * 1024 * 1024
 BODY_LIMIT = DOCUMENT_LIMIT + 65536
 TASK_BACKGROUND_LIMIT = 2000
-SESSION_SECONDS = 7 * 86400
+# Zero means no automatic expiry, but only after the explicit legacy migration.
+PERSISTENT_SESSION_EXPIRY = 0
 MAX_USERS = 100
 DATABASE_LIMIT = 256 * 1024 * 1024
 DISK_RESERVE = 512 * 1024 * 1024
@@ -51,6 +53,7 @@ class Config:
     database: Path
     bootstrap_token_hash: str | None = None
     port: int = 4180
+    release_catalog: Path = Path("/var/www/hero-oos-updates/versions.json")
 
     @classmethod
     def load(cls, path: str) -> Config:
@@ -64,7 +67,10 @@ class Config:
         port = data.get("port", 4180)
         if type(port) is not int or not 1024 <= port <= 65535:
             raise ValueError("port must be an integer from 1024 to 65535")
-        return cls(database=database, bootstrap_token_hash=digest, port=port)
+        release_catalog = Path(data.get("releaseCatalog", "/var/www/hero-oos-updates/versions.json"))
+        if not release_catalog.is_absolute():
+            raise ValueError("releaseCatalog must be an absolute path")
+        return cls(database=database, bootstrap_token_hash=digest, port=port, release_catalog=release_catalog)
 
 
 class APIError(Exception):
@@ -470,6 +476,25 @@ class Store:
     def execute(self, sql, args=()):
         return self.db.execute(sql, args)
 
+    def migrate_persistent_sessions(self):
+        """Retain only currently authorized sessions; never resurrect expired tokens."""
+        with self.transaction():
+            marker = self.one("SELECT value FROM metadata WHERE key='persistent_sessions_v1'")
+            if marker is not None and marker["value"] != "1":
+                raise RuntimeError("Unsupported session policy; refusing migration")
+            now = int(time.time())
+            if marker is None:
+                # Before this marker, even a legacy zero meant already expired.
+                self.execute("DELETE FROM sessions WHERE expires_at<=?", (now,))
+            else:
+                self.execute("DELETE FROM sessions WHERE expires_at<>0 AND expires_at<=?", (now,))
+            self.execute("""DELETE FROM sessions WHERE NOT EXISTS (
+              SELECT 1 FROM users u JOIN memberships m ON m.user_id=u.id
+              WHERE u.id=sessions.user_id AND m.org_id=sessions.org_id
+                AND u.status='approved' AND m.status='approved')""")
+            self.execute("UPDATE sessions SET expires_at=0 WHERE expires_at>?", (now,))
+            self.execute("INSERT OR IGNORE INTO metadata VALUES('persistent_sessions_v1','1')")
+
 
 @web.middleware
 async def errors(request, handler):
@@ -513,15 +538,186 @@ async def loopback_and_headers(request, handler):
     return await handler(request)
 
 
+@dataclass(eq=False)
+class EventSubscriber:
+    """Only a wakeup is queued; revisions are read at the authorized send time."""
+    request: web.Request
+    user_id: str | None
+    org_id: str | None
+    session_hash: str | None
+    queue: asyncio.Queue
+
+    def wake(self):
+        if self.queue.empty():
+            self.queue.put_nowait(True)
+
+
 class Service:
     def __init__(self, config: Config):
         self.config = config
         self.store = Store(config)
+        self.store.migrate_persistent_sessions()
         self.limiter = RateLimiter()
         self.hasher = PasswordHasher(time_cost=2, memory_cost=19456, parallelism=1, type=Type.ID)
         self.hash_slots = asyncio.Semaphore(1)
         self.hash_waiters = 0
         self.dummy_hash = self.hasher.hash(secrets.token_urlsafe(32))
+        self.subscribers: set[EventSubscriber] = set()
+        self.event_tasks: set[asyncio.Task] = set()
+        self.events_closing = False
+        self.release_build = 0
+        self.release_fingerprint = None
+        self.release_watcher: asyncio.Task | None = None
+        self.event_heartbeat_seconds = 20
+        self.release_watch_seconds = 2
+        self.max_event_connections = 512
+        self.max_session_connections = 4
+        self.max_user_connections = 8
+        self.max_public_connections = 256
+
+    def notify_state(self, actor, personal=False):
+        for subscriber in self.subscribers:
+            if subscriber.user_id is not None and (
+                subscriber.user_id == actor["user_id"] if personal else subscriber.org_id == actor["org_id"]
+            ):
+                subscriber.wake()
+
+    def notify_auth_change(self):
+        # Wake authorized streams so revocation is observed promptly, rather
+        # than waiting for the next heartbeat. Unchanged streams send no event.
+        for subscriber in self.subscribers:
+            if subscriber.user_id is not None:
+                subscriber.wake()
+
+    def refresh_release_build(self):
+        """A local catalog notification is a hint, never update signature trust."""
+        path = self.config.release_catalog
+        try:
+            if path.is_symlink():
+                return
+            metadata = path.stat()
+            fingerprint = (metadata.st_ino, metadata.st_mtime_ns, metadata.st_size)
+            if (not stat.S_ISREG(metadata.st_mode) or fingerprint == self.release_fingerprint or
+                    metadata.st_size > 256 * 1024):
+                return
+            with path.open("rb") as handle:
+                raw = handle.read(256 * 1024 + 1)
+            if len(raw) > 256 * 1024:
+                return
+            catalog = json.loads(raw)
+            if not isinstance(catalog, dict):
+                return
+            entries = catalog.get("versions")
+            if catalog.get("formatVersion") != 1 or not isinstance(entries, list) or len(entries) > 10:
+                return
+            builds = [entry.get("build") for entry in entries if isinstance(entry, dict)]
+            if len(builds) != len(entries) or any(type(build) is not int or not 0 < build <= 2**53 - 1 for build in builds):
+                return
+            build = max(builds, default=0)
+            self.release_fingerprint = fingerprint
+        except (OSError, ValueError, RecursionError, UnicodeError):
+            return
+        if self.release_build != build:
+            self.release_build = build
+            for subscriber in self.subscribers:
+                subscriber.wake()
+
+    async def start_events(self):
+        self.refresh_release_build()
+
+        async def watch():
+            while not self.events_closing:
+                await asyncio.sleep(self.release_watch_seconds)
+                self.refresh_release_build()
+
+        self.release_watcher = asyncio.create_task(watch())
+
+    async def stop_events(self):
+        self.events_closing = True
+        if self.release_watcher is not None:
+            self.release_watcher.cancel()
+            await asyncio.gather(self.release_watcher, return_exceptions=True)
+        for subscriber in self.subscribers:
+            subscriber.wake()
+        if self.event_tasks:
+            _, remaining = await asyncio.wait(self.event_tasks.copy(), timeout=5)
+            for task in remaining:
+                task.cancel()
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
+
+    def event_payload(self, subscriber):
+        if subscriber.user_id is None:
+            return {"releaseBuild": self.release_build}
+        actor = self.auth(subscriber.request)
+        if actor["user_id"] != subscriber.user_id or actor["org_id"] != subscriber.org_id:
+            unauthorized()
+        organization = self.store.one("SELECT revision FROM organization_states WHERE org_id=?", (actor["org_id"],))
+        personal = self.store.one("SELECT revision FROM personal_states WHERE user_id=?", (actor["user_id"],))
+        return {"organizationRevision": organization["revision"] if organization else 0,
+                "personalRevision": personal["revision"] if personal else 0, "releaseBuild": self.release_build}
+
+    async def state_events(self, request):
+        return await self.stream_events(request, authenticated=True)
+
+    async def update_events(self, request):
+        return await self.stream_events(request, authenticated=False)
+
+    async def stream_events(self, request, authenticated):
+        actor = self.auth(request) if authenticated else None
+        session_hash = request.get(SESSION_HASH_KEY) if authenticated else None
+        if self.events_closing:
+            raise APIError(503, "unavailable", "服务正在重启，请稍后重新连接")
+        public = [s for s in self.subscribers if s.user_id is None]
+        if (len(self.subscribers) >= self.max_event_connections or
+            (authenticated and (sum(s.session_hash == session_hash for s in self.subscribers) >= self.max_session_connections or
+                                sum(s.user_id == actor["user_id"] for s in self.subscribers) >= self.max_user_connections)) or
+            (not authenticated and (len(public) >= self.max_public_connections or
+             sum(s.request[CLIENT_IP_KEY] == request[CLIENT_IP_KEY] for s in public) >= 128))):
+            raise APIError(429, "rate_limited", "通知连接过多，请稍后重新连接")
+        if not authenticated:
+            self.limiter.check("update-events:" + request[CLIENT_IP_KEY], 240, 60)
+        subscriber = EventSubscriber(request, actor["user_id"] if actor else None,
+                                     actor["org_id"] if actor else None, session_hash, asyncio.Queue(maxsize=1))
+        # Register before preparing the response so a concurrent commit cannot
+        # land between the initial snapshot and notification registration.
+        self.subscribers.add(subscriber)
+        task = asyncio.current_task()
+        self.event_tasks.add(task)
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-store", "X-Accel-Buffering": "no", "X-Content-Type-Options": "nosniff"})
+        try:
+            await response.prepare(request)
+            last = None
+            subscriber.wake()
+            while not self.events_closing:
+                heartbeat = False
+                try:
+                    await asyncio.wait_for(subscriber.queue.get(), timeout=self.event_heartbeat_seconds)
+                except asyncio.TimeoutError:
+                    heartbeat = True
+                if self.events_closing or request.transport is None or request.transport.is_closing():
+                    break
+                # Re-authenticate before every state event and heartbeat, even
+                # without changes. Logout/suspension cannot keep a live stream.
+                payload = self.event_payload(subscriber)
+                if payload != last:
+                    kind = "state" if authenticated else "release"
+                    data = f"event: {kind}\ndata: {canonical(payload)}\n\n".encode()
+                    await asyncio.wait_for(response.write(data), timeout=10)
+                    last = payload
+                elif heartbeat:
+                    await asyncio.wait_for(response.write(b": keepalive\n\n"), timeout=10)
+        except (APIError, ConnectionError, asyncio.TimeoutError):
+            pass  # Headers are already sent; EOF makes the client reconnect/authenticate.
+        finally:
+            self.subscribers.discard(subscriber)
+            self.event_tasks.discard(task)
+        try:
+            await response.write_eof()
+        except (ConnectionError, RuntimeError):
+            pass
+        return response
 
     async def body(self, request):
         if request.content_type != "application/json":
@@ -577,10 +773,9 @@ class Service:
 
     def issue_session(self, user_id, org_id):
         token = secrets.token_urlsafe(32)
-        expires = int(time.time()) + SESSION_SECONDS
-        self.store.execute("DELETE FROM sessions WHERE expires_at<=?", (int(time.time()),))
-        self.store.execute("INSERT INTO sessions(token_hash,user_id,org_id,expires_at) VALUES(?,?,?,?)", (sha(token), user_id, org_id, expires))
-        return {"token": token, "expiresAt": instant(expires), **self.profile(user_id, org_id)}
+        self.store.execute("DELETE FROM sessions WHERE expires_at<>0 AND expires_at<=?", (int(time.time()),))
+        self.store.execute("INSERT INTO sessions(token_hash,user_id,org_id,expires_at) VALUES(?,?,?,?)", (sha(token), user_id, org_id, PERSISTENT_SESSION_EXPIRY))
+        return {"token": token, "expiresAt": None, **self.profile(user_id, org_id)}
 
     def auth(self, request):
         header = request.headers.get("Authorization", "")
@@ -589,7 +784,8 @@ class Service:
         digest = sha(header[7:])
         row = self.store.one("""SELECT s.user_id,s.org_id,s.expires_at,m.role FROM sessions s
           JOIN users u ON u.id=s.user_id JOIN memberships m ON m.user_id=s.user_id AND m.org_id=s.org_id
-          WHERE s.token_hash=? AND s.expires_at>? AND u.status='approved' AND m.status='approved'""", (digest, int(time.time())))
+          WHERE s.token_hash=? AND (s.expires_at=0 OR s.expires_at>?)
+            AND u.status='approved' AND m.status='approved'""", (digest, int(time.time())))
         if row is None:
             unauthorized()
         request[SESSION_HASH_KEY] = digest
@@ -670,7 +866,8 @@ class Service:
             unauthorized()
         with self.store.transaction():
             membership = self.store.one("""SELECT m.org_id FROM memberships m JOIN organizations o ON o.id=m.org_id
-              JOIN users u ON u.id=m.user_id WHERE m.user_id=? AND o.name_key=? AND m.status='approved' AND u.status='approved'""", (user["id"], org_key))
+              JOIN users u ON u.id=m.user_id WHERE m.user_id=? AND o.name_key=? AND m.status='approved' AND u.status='approved'
+                AND u.password_hash=?""", (user["id"], org_key, user["password_hash"]))
             if membership is None:
                 unauthorized()
             result = self.issue_session(user["id"], membership["org_id"])
@@ -679,6 +876,7 @@ class Service:
     async def logout(self, request):
         self.auth(request)
         self.store.execute("DELETE FROM sessions WHERE token_hash=?", (request[SESSION_HASH_KEY],))
+        self.notify_auth_change()
         return web.json_response({"ok": True})
 
     async def me(self, request):
@@ -740,6 +938,7 @@ class Service:
                 self.store.execute("UPDATE users SET status='approved' WHERE id=? AND status='pending'", (target["user_id"],))
             else:
                 self.store.execute("DELETE FROM sessions WHERE user_id=? AND org_id=?", (target["user_id"], actor["org_id"]))
+        self.notify_auth_change()
         return web.json_response({"ok": True})
 
     async def rename_organization(self, request):
@@ -818,6 +1017,7 @@ class Service:
               DO UPDATE SET revision=excluded.revision,document=excluded.document,updated_at=excluded.updated_at""", (actor[key], next_revision, encoded, int(time.time())))
             result = {"ok": True, "revision": next_revision}
             self.record_mutation(actor["user_id"], scope, mutation, payload, result)
+        self.notify_state(actor, personal=personal)
         return web.json_response(result)
 
     async def get_shared(self, request):
@@ -843,6 +1043,8 @@ def create_app(config: Config) -> web.Application:
     app[SERVICE_KEY] = service
     app.add_routes([
         web.get("/health", service.health),
+        web.get("/v1/events", service.state_events, allow_head=False),
+        web.get("/v1/update-events", service.update_events, allow_head=False),
         web.post("/v1/auth/bootstrap", service.bootstrap),
         web.post("/v1/auth/register", service.register),
         web.post("/v1/auth/login", service.login),
@@ -865,6 +1067,14 @@ def create_app(config: Config) -> web.Application:
     async def close(_):
         service.store.db.close()
 
+    async def start_events(_):
+        await service.start_events()
+
+    async def stop_events(_):
+        await service.stop_events()
+
+    app.on_startup.append(start_events)
+    app.on_shutdown.append(stop_events)
     app.on_cleanup.append(close)
     return app
 

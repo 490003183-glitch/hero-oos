@@ -46,9 +46,9 @@ import XCTest
     }
     func testFailedSwitchFromLocalRecoversDraftByLogoutWithoutSuccessfulFlush() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("hero-workspace-recovery-\(UUID().uuidString)")
-        let workspace = CloudWorkspace(localRoot: root, accountsRoot: root.appendingPathComponent("accounts"), makeStores: factory)
+        let workspace = CloudWorkspace(localRoot: root, accountsRoot: root.appendingPathComponent("accounts"), makeStores: factory, eventTransport: TestIdleServerEventTransport())
         let transport = TestCloudTransport()
-        let account = CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: TestCloudCredentials(), bootstrap: TestCloudBootstrap())
+        let account = CloudAccount(api: CloudAPI(transport: transport), credentials: TestCloudCredentials(), bootstrap: TestCloudBootstrap())
         XCTAssertFalse(workspace.matches(account: account)) // Never expose an uninitialized empty store.
         await workspace.activate(account: account)
         let original = workspace.store
@@ -68,9 +68,9 @@ import XCTest
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("hero-cloud-recovery-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let workspace = CloudWorkspace(localRoot: root, accountsRoot: root.appendingPathComponent("accounts"), makeStores: factory)
+        let workspace = CloudWorkspace(localRoot: root, accountsRoot: root.appendingPathComponent("accounts"), makeStores: factory, eventTransport: TestIdleServerEventTransport())
         let transport = TestCloudTransport()
-        let account = CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: TestCloudCredentials(), bootstrap: TestCloudBootstrap())
+        let account = CloudAccount(api: CloudAPI(transport: transport), credentials: TestCloudCredentials(), bootstrap: TestCloudBootstrap())
         await login(account, transport: transport, user: "original-user")
         transport.reply(["revision": 0, "document": nil])
         await workspace.activate(account: account)

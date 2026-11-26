@@ -234,18 +234,18 @@ final class TaskGraphIntegrationTests: SwiftIntegrationCase {
         let history = (0..<28).map { index in
             Record(["id": .string("history-\(index)"), "title": "历史任务", "status": .string(index < 19 ? "completed" : "cancelled")])
         }
-        let source = [Record(["id": "example-secondary", "title": "示例乙录音项目", "status": "waiting"])] + history +
-            [Record(["id": "example-project", "title": "示例甲录音项目", "status": "waiting"]),
+        let source = [Record(["id": "project-demo", "title": "示例项目录音项目", "status": "waiting"])] + history +
+            [Record(["id": "client-demo", "title": "示例客户录音项目", "status": "waiting"]),
              Record(["id": "archived", "title": "已归档", "status": "ready", "archived": true])]
         let graph = TaskGraphModel(); graph.reconcile(source)
         let before = graph.layout
-        XCTAssertGreaterThan(before.positions["example-project"]!.y - before.positions["example-secondary"]!.y, 1000)
+        XCTAssertGreaterThan(before.positions["client-demo"]!.y - before.positions["project-demo"]!.y, 1000)
 
         graph.arrange()
 
-        XCTAssertEqual(graph.layout.positions["example-secondary"]?.y, 0)
-        XCTAssertEqual(graph.layout.positions["example-project"]?.y, 0)
-        XCTAssertEqual(graph.layout.positions["example-project"]?.x, 340)
+        XCTAssertEqual(graph.layout.positions["project-demo"]?.y, 0)
+        XCTAssertEqual(graph.layout.positions["client-demo"]?.y, 0)
+        XCTAssertEqual(graph.layout.positions["client-demo"]?.x, 340)
         for task in history + [source.last!] { XCTAssertEqual(graph.layout.positions[task.id], before.positions[task.id]) }
         XCTAssertEqual(graph.tasks, source)
         XCTAssertEqual(graph.undoCount, 1)

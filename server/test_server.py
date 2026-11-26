@@ -34,18 +34,25 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hero-oos-cloud-test-")
         self.bootstrap_token = secrets.token_urlsafe(40)
-        self.app = create_app(Config(Path(self.temporary.name) / "state.sqlite3", sha(self.bootstrap_token)))
+        self.catalog_path = Path(self.temporary.name) / "versions.json"
+        self.catalog_path.write_text(json.dumps({"formatVersion": 1, "versions": [{"build": 34}]}))
+        self.app = create_app(Config(Path(self.temporary.name) / "state.sqlite3", sha(self.bootstrap_token), release_catalog=self.catalog_path))
         self.service = self.app[SERVICE_KEY]
+        self.service.event_heartbeat_seconds = 0.08
+        self.service.release_watch_seconds = 0.03
+        self.stream_responses = []
         self.db = self.service.store
         self.client = TestClient(TestServer(self.app))
         await self.client.start_server()
         response, self.owner = await self.call("POST", "/v1/auth/bootstrap", body={
-            "bootstrapToken": self.bootstrap_token, "organization": "Example Team", "username": "Owner", "password": PASSWORD})
+            "bootstrapToken": self.bootstrap_token, "organization": "Example Org", "username": "Owner", "password": PASSWORD})
         self.assertEqual(response.status, 201)
         self.token = self.owner["token"]
         self.org = self.owner["organization"]["id"]
 
     async def asyncTearDown(self):
+        for response in self.stream_responses:
+            response.close()
         await self.client.close()
         self.temporary.cleanup()
 
@@ -56,14 +63,14 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.request(method, path, json=body, headers=hdr)
         return response, await response.json()
 
-    async def register(self, name="alice", organization="Example Team"):
+    async def register(self, name="alice", organization="Example Org"):
         response, data = await self.call("POST", "/v1/auth/register", body={"organization": organization, "username": name, "password": PASSWORD})
         self.assertEqual(response.status, 201, data)
         self.assertNotIn("token", data)
         self.assertEqual(data["status"], "pending")
         return self.db.one("SELECT m.* FROM memberships m JOIN users u ON u.id=m.user_id WHERE u.username_key=?", (name.lower(),))
 
-    async def login(self, name, organization="Example Team"):
+    async def login(self, name, organization="Example Org"):
         return await self.call("POST", "/v1/auth/login", body={"organization": organization, "username": name, "password": PASSWORD})
 
     async def approved(self, name="alice", role="member"):
@@ -73,6 +80,201 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         response, login = await self.login(name)
         self.assertEqual(response.status, 200, login)
         return member, login
+
+    async def stream(self, token=None, path="/v1/events"):
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        response = await self.client.get(path, headers=headers)
+        self.stream_responses.append(response)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, "text/event-stream")
+        self.assertEqual(response.headers["X-Accel-Buffering"], "no")
+        return response
+
+    async def stream_event(self, response, timeout=1):
+        async def read():
+            kind, data = None, []
+            while True:
+                line = await response.content.readline()
+                if not line:
+                    return None
+                if line in (b"\n", b"\r\n"):
+                    if kind and data:
+                        return kind, json.loads("\n".join(data))
+                    kind, data = None, []
+                elif line.startswith(b"event: "):
+                    kind = line[7:].strip().decode()
+                elif line.startswith(b"data: "):
+                    data.append(line[6:].strip().decode())
+        return await asyncio.wait_for(read(), timeout)
+
+    async def no_stream_event(self, response):
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.stream_event(response, timeout=0.15)
+
+    async def test_streams_require_auth_and_public_updates_never_include_task_revisions(self):
+        response, error = await self.call("GET", "/v1/events")
+        self.assertEqual(response.status, 401)
+        self.assertEqual(error["error"], "unauthorized")
+        self.assertEqual(len(self.service.subscribers), 0)
+        stream = await self.stream(self.token)
+        self.assertEqual(await self.stream_event(stream), ("state", {
+            "organizationRevision": 0, "personalRevision": 0, "releaseBuild": 34}))
+        public = await self.stream(path="/v1/update-events")
+        self.assertEqual(await self.stream_event(public), ("release", {"releaseBuild": 34}))
+        await self.call("PUT", "/v1/organization/state", self.token,
+                        {"expectedRevision": 0, "mutationId": "public-must-not-see", "document": organization_document("secret title")})
+        self.assertEqual((await self.stream_event(stream))[1]["organizationRevision"], 1)
+        await self.no_stream_event(public)
+
+    async def test_organization_commit_pushes_all_members_but_private_commit_only_its_owner(self):
+        _, alice = await self.approved()
+        owner_stream = await self.stream(self.token)
+        alice_stream = await self.stream(alice["token"])
+        await self.stream_event(owner_stream); await self.stream_event(alice_stream)
+        response, result = await self.call("PUT", "/v1/organization/state", self.token,
+            {"expectedRevision": 0, "mutationId": "org-push", "document": organization_document("updated")})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(result["revision"], 1)
+        for stream in (owner_stream, alice_stream):
+            self.assertEqual((await self.stream_event(stream))[1], {
+                "organizationRevision": 1, "personalRevision": 0, "releaseBuild": 34})
+        await self.call("PUT", "/v1/personal/state", self.token,
+            {"expectedRevision": 0, "mutationId": "private-push", "document": personal_document("owner secret")})
+        self.assertEqual((await self.stream_event(owner_stream))[1]["personalRevision"], 1)
+        await self.no_stream_event(alice_stream)
+        await self.call("PUT", "/v1/personal/state", alice["token"],
+            {"expectedRevision": 0, "mutationId": "alice-private", "document": personal_document("alice secret")})
+        self.assertEqual((await self.stream_event(alice_stream))[1]["personalRevision"], 1)
+        await self.no_stream_event(owner_stream)
+
+    async def test_stream_binding_isolates_organizations_and_preserves_same_user_private_scope(self):
+        self.second_org()
+        _, other = await self.login("owner", "OTHER")
+        first = await self.stream(self.token)
+        second = await self.stream(other["token"])
+        await self.stream_event(first); await self.stream_event(second)
+        await self.call("PUT", "/v1/organization/state", self.token,
+            {"expectedRevision": 0, "mutationId": "only-first-org", "document": organization_document("first org")})
+        self.assertEqual((await self.stream_event(first))[1]["organizationRevision"], 1)
+        await self.no_stream_event(second)
+        await self.call("PUT", "/v1/personal/state", self.token,
+            {"expectedRevision": 0, "mutationId": "own-private-across-orgs", "document": personal_document()})
+        first_event, second_event = await self.stream_event(first), await self.stream_event(second)
+        self.assertEqual(first_event[1]["personalRevision"], 1)
+        self.assertEqual(second_event[1]["personalRevision"], 1)
+        self.assertEqual(second_event[1]["organizationRevision"], 0)
+
+    async def test_revoked_member_stream_closes_before_any_new_state_is_sent(self):
+        member, alice = await self.approved()
+        stream = await self.stream(alice["token"])
+        await self.stream_event(stream)
+        await self.call("PATCH", "/v1/members/" + member["id"], self.token, {"status": "suspended"})
+        await self.call("PUT", "/v1/organization/state", self.token,
+            {"expectedRevision": 0, "mutationId": "after-revoke", "document": organization_document("must not reach alice")})
+        self.assertIsNone(await self.stream_event(stream))
+        response, _ = await self.call("GET", "/v1/events", alice["token"])
+        self.assertEqual(response.status, 401)
+        self.assertFalse(any(s.user_id == alice["user"]["id"] for s in self.service.subscribers))
+
+    async def test_logout_and_heartbeat_auth_recheck_close_existing_streams(self):
+        stream = await self.stream(self.token)
+        await self.stream_event(stream)
+        await self.call("POST", "/v1/auth/logout", self.token)
+        self.assertIsNone(await self.stream_event(stream))
+        _, login = await self.login("owner")
+        another = await self.stream(login["token"])
+        await self.stream_event(another)
+        # Simulate expiry or an out-of-band admin revocation without a wakeup.
+        self.db.execute("DELETE FROM sessions WHERE token_hash=?", (sha(login["token"]),))
+        self.assertIsNone(await self.stream_event(another))
+
+    async def test_failed_and_retried_mutations_do_not_generate_false_state_events(self):
+        stream = await self.stream(self.token)
+        await self.stream_event(stream)
+        payload = {"expectedRevision": 0, "mutationId": "one-change", "document": organization_document()}
+        await self.call("PUT", "/v1/organization/state", self.token, payload)
+        self.assertEqual((await self.stream_event(stream))[1]["organizationRevision"], 1)
+        response, _ = await self.call("PUT", "/v1/organization/state", self.token, payload)
+        self.assertEqual(response.status, 200)
+        response, _ = await self.call("PUT", "/v1/organization/state", self.token, {**payload, "mutationId": "conflict"})
+        self.assertEqual(response.status, 409)
+        await self.no_stream_event(stream)
+
+    async def test_release_file_changes_are_pushed_without_a_client_catalog_request(self):
+        private = await self.stream(self.token)
+        public = await self.stream(path="/v1/update-events")
+        await self.stream_event(private); await self.stream_event(public)
+        self.catalog_path.write_text(json.dumps({"formatVersion": 1, "versions": [{"build": 36}, {"build": 34}]}))
+        self.assertEqual(await self.stream_event(public), ("release", {"releaseBuild": 36}))
+        self.assertEqual((await self.stream_event(private))[1], {
+            "organizationRevision": 0, "personalRevision": 0, "releaseBuild": 36})
+        self.catalog_path.write_text("[]")
+        await self.no_stream_event(public)
+        self.catalog_path.write_text(json.dumps({"formatVersion": 1, "versions": [{"build": 37}]}))
+        self.assertEqual(await self.stream_event(public), ("release", {"releaseBuild": 37}))
+
+    async def test_event_connections_are_bounded_coalesce_and_cleanup_on_close(self):
+        self.service.max_session_connections = 1
+        stream = await self.stream(self.token)
+        await self.stream_event(stream)
+        response, error = await self.call("GET", "/v1/events", self.token)
+        self.assertEqual(response.status, 429)
+        self.assertEqual(error["error"], "rate_limited")
+        subscriber = next(iter(self.service.subscribers))
+        for _ in range(100):
+            subscriber.wake()
+        self.assertEqual(subscriber.queue.qsize(), 1)
+        stream.close()
+        await asyncio.sleep(0.12)
+        self.assertEqual(len(self.service.subscribers), 0)
+        self.assertEqual(len(self.service.event_tasks), 0)
+
+    async def test_reconnect_initial_snapshot_catches_changes_missed_while_offline(self):
+        stream = await self.stream(self.token)
+        await self.stream_event(stream)
+        stream.close()
+        await self.call("PUT", "/v1/organization/state", self.token,
+            {"expectedRevision": 0, "mutationId": "changed-offline", "document": organization_document("changed offline")})
+        reconnected = await self.stream(self.token)
+        self.assertEqual((await self.stream_event(reconnected))[1], {
+            "organizationRevision": 1, "personalRevision": 0, "releaseBuild": 34})
+
+    async def test_public_stream_capacity_preserves_authenticated_notification_capacity(self):
+        self.service.max_public_connections = 1
+        public = await self.stream(path="/v1/update-events")
+        await self.stream_event(public)
+        response, error = await self.call("GET", "/v1/update-events")
+        self.assertEqual(response.status, 429)
+        self.assertEqual(error["error"], "rate_limited")
+        private = await self.stream(self.token)
+        self.assertEqual((await self.stream_event(private))[0], "state")
+
+    async def test_event_shutdown_closes_streams_before_database_cleanup(self):
+        private = await self.stream(self.token)
+        public = await self.stream(path="/v1/update-events")
+        await self.stream_event(private); await self.stream_event(public)
+        await self.service.stop_events()
+        self.assertIsNone(await self.stream_event(private))
+        self.assertIsNone(await self.stream_event(public))
+        self.assertEqual(len(self.service.subscribers), 0)
+        self.assertEqual(len(self.service.event_tasks), 0)
+        self.assertTrue(self.service.release_watcher.done())
+        response, _ = await self.call("GET", "/v1/events", self.token)
+        self.assertEqual(response.status, 503)
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM users")["n"], 1)
+
+    async def test_malformed_oversized_and_symlinked_release_hints_are_ignored(self):
+        for raw in ["[]", "{bad json", json.dumps({"formatVersion": 1, "versions": [{"build": True}]}),
+                    json.dumps({"formatVersion": 1, "versions": [{"build": -1}]}), " " * (256 * 1024 + 1)]:
+            self.catalog_path.write_text(raw)
+            self.service.refresh_release_build()
+            self.assertEqual(self.service.release_build, 34)
+        elsewhere = Path(self.temporary.name) / "not-the-release-directory.json"
+        elsewhere.write_text(json.dumps({"formatVersion": 1, "versions": [{"build": 999}]}))
+        self.catalog_path.unlink()
+        self.catalog_path.symlink_to(elsewhere)
+        self.service.refresh_release_build()
+        self.assertEqual(self.service.release_build, 34)
 
     def second_org(self):
         org = uid()
@@ -89,7 +291,7 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bootstrap_is_one_time_and_only_hashes_are_stored(self):
         response, error = await self.call("POST", "/v1/auth/bootstrap", body={
-            "bootstrapToken": self.bootstrap_token, "organization": "Example Team", "username": "new-owner", "password": PASSWORD})
+            "bootstrapToken": self.bootstrap_token, "organization": "Example Org", "username": "new-owner", "password": PASSWORD})
         self.assertEqual(response.status, 409)
         self.assertEqual(error["error"], "already_initialized")
         response, _ = await self.call("POST", "/v1/auth/bootstrap", body={"bootstrapToken": "bad"})
@@ -136,7 +338,7 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_username_unique_case_insensitive(self):
         await self.register("Alice")
-        response, data = await self.call("POST", "/v1/auth/register", body={"organization": "example team", "username": "ALICE", "password": PASSWORD})
+        response, data = await self.call("POST", "/v1/auth/register", body={"organization": "example org", "username": "ALICE", "password": PASSWORD})
         self.assertEqual(response.status, 409)
         self.assertEqual(data["error"], "account_unavailable")
         self.assertEqual(self.db.one("SELECT COUNT(*) n FROM users")["n"], 2)
@@ -370,7 +572,7 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
     async def test_organization_scope_is_session_bound_and_mutations_are_org_scoped(self):
         other_org = self.second_org()
         _, other = await self.login("owner", "OTHER")
-        body = {"expectedRevision": 0, "mutationId": "same-id", "document": organization_document("Example Team")}
+        body = {"expectedRevision": 0, "mutationId": "same-id", "document": organization_document("Example Org")}
         response, _ = await self.call("PUT", "/v1/organization/state", self.token, body, headers={"X-Organization-ID": other_org})
         self.assertEqual(response.status, 200)
         _, untouched = await self.call("GET", "/v1/organization/state", other["token"])
@@ -379,7 +581,7 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         _, first = await self.call("GET", "/v1/organization/state", self.token)
         _, second = await self.call("GET", "/v1/organization/state", other["token"])
-        self.assertEqual(first["document"]["state"]["tasks"][0]["title"], "Example Team")
+        self.assertEqual(first["document"]["state"]["tasks"][0]["title"], "Example Org")
         self.assertEqual(second["document"]["state"]["tasks"][0]["title"], "OTHER")
         response, _ = await self.call("PUT", "/v1/organization/state", self.token, {**body, "orgId": other_org})
         self.assertEqual(response.status, 400)
@@ -410,8 +612,8 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
             value["state"][key] = []
             invalid.append(value)
         for fields in ({"taskSpace": "personal"}, {"taskSpace": None}, {"taskSpace": "unknown"},
-                       {"codexThreadId": "local-thread"}, {"codexSummary": "private"}, {"source": "/example/local/file"},
-                       {"localPath": "/example/local/file"}, {"collage": {}}, {"futureSecretField": "secret"},
+                       {"codexThreadId": "local-thread"}, {"codexSummary": "private"}, {"source": "/Users/person/file"},
+                       {"localPath": "/Users/person/file"}, {"collage": {}}, {"futureSecretField": "secret"},
                        {"notes": {"secret": "nested"}}, {"details": [{"path": "secret"}]},
                        {"peopleWaits": [{"id": "p1", "person": "someone", "outcome": "", "resolved": False, "path": "secret"}]},
                        {"peopleWaits": [{"id": "p1", "person": "someone", "outcome": "", "resolved": "false"}]},
@@ -439,7 +641,7 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         page = "page-" + uid()
         valid = organization_document("Parent", taskSpace=page, trackId="track-1", details=["delivery", "invoice"],
                                       priority=5, archived=False, notes=None, availableAt="2026-10-20T12:00:00+08:00",
-                                      peopleWaits=[{"id": "p1", "person": "sample-person", "outcome": "invoice", "resolved": False}])
+                                      peopleWaits=[{"id": "p1", "person": "alice", "outcome": "invoice", "resolved": False}])
         valid["state"]["tasks"].append({"id": "child", "title": "Child", "taskSpace": page, "parentId": "task-1", "dependsOn": ["task-1"]})
         valid["state"]["tracks"] = [{"id": "track-1", "name": "Track", "stages": ["delivery", "settlement"]}]
         valid["state"]["taskPages"] = [{"id": page, "title": "Organization page"}]
@@ -501,7 +703,7 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_account_limit_includes_pending_and_concurrent_registration(self):
         self.seed_pending(MAX_USERS - 2)
-        results = await asyncio.gather(*(self.call("POST", "/v1/auth/register", body={"organization": "Example Team", "username": f"last{n}", "password": PASSWORD}) for n in range(2)))
+        results = await asyncio.gather(*(self.call("POST", "/v1/auth/register", body={"organization": "Example Org", "username": f"last{n}", "password": PASSWORD}) for n in range(2)))
         self.assertEqual(sorted(r.status for r, _ in results), [201, 409])
         self.assertEqual(self.db.one("SELECT COUNT(*) n FROM users")["n"], MAX_USERS)
         self.assertEqual(next(data["error"] for r, data in results if r.status == 409), "user_limit")
@@ -509,17 +711,17 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_initial_registration_frees_slot_without_reusing_identity(self):
         rejected = await self.register("alice")
         self.seed_pending(MAX_USERS - 2)
-        response, _ = await self.call("POST", "/v1/auth/register", body={"organization": "Example Team", "username": "new-user", "password": PASSWORD})
+        response, _ = await self.call("POST", "/v1/auth/register", body={"organization": "Example Org", "username": "new-user", "password": PASSWORD})
         self.assertEqual(response.status, 409)
         response, _ = await self.call("PATCH", "/v1/members/" + rejected["id"], self.token, {"status": "rejected"})
         self.assertEqual(response.status, 200)
         retained = self.db.one("SELECT id,username FROM users WHERE username_key='alice'")
         self.assertEqual(retained["id"], rejected["user_id"])
         self.assertEqual(retained["username"], "alice")
-        response, unavailable = await self.call("POST", "/v1/auth/register", body={"organization": "Example Team", "username": "ALICE", "password": PASSWORD})
+        response, unavailable = await self.call("POST", "/v1/auth/register", body={"organization": "Example Org", "username": "ALICE", "password": PASSWORD})
         self.assertEqual(response.status, 409)
         self.assertEqual(unavailable["error"], "account_unavailable")
-        response, _ = await self.call("POST", "/v1/auth/register", body={"organization": "Example Team", "username": "new-user", "password": PASSWORD})
+        response, _ = await self.call("POST", "/v1/auth/register", body={"organization": "Example Org", "username": "new-user", "password": PASSWORD})
         self.assertEqual(response.status, 201)
         replacement = self.db.one("SELECT id FROM users WHERE username_key='new-user'")
         self.assertNotEqual(replacement["id"], rejected["user_id"])
@@ -543,9 +745,9 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.one("SELECT status FROM users WHERE id=?", (member["user_id"],))["status"], "approved")
         response, _ = await self.login("alice", "OTHER")
         self.assertEqual(response.status, 200)
-        response, _ = await self.login("alice", "Example Team")
+        response, _ = await self.login("alice", "Example Org")
         self.assertEqual(response.status, 401)
-        response, full = await self.call("POST", "/v1/auth/register", body={"organization": "Example Team", "username": "overflow", "password": PASSWORD})
+        response, full = await self.call("POST", "/v1/auth/register", body={"organization": "Example Org", "username": "overflow", "password": PASSWORD})
         self.assertEqual(response.status, 409)
         self.assertEqual(full["error"], "user_limit")
 
@@ -562,22 +764,101 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         response, _ = await self.call("GET", "/v1/me", session["token"])
         self.assertEqual(response.status, 401)
 
+    async def test_persistent_sessions_survive_time_and_other_device_login(self):
+        self.assertIsNone(self.owner["expiresAt"])
+        response, session = await self.login("owner")
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(session["expiresAt"])
+        self.assertNotEqual(session["token"], self.token)
+        self.assertEqual([r["expires_at"] for r in self.db.all("SELECT expires_at FROM sessions")], [0, 0])
+        with patch("server.time.time", return_value=int(time.time()) + 100 * 365 * 86400):
+            for token in (self.token, session["token"]):
+                actor = self.service.auth(make_mocked_request("GET", "/v1/me", headers={"Authorization": "Bearer " + token}))
+                self.assertEqual(actor["user_id"], self.owner["user"]["id"])
+        await self.call("POST", "/v1/auth/logout", session["token"])
+        self.assertEqual((await self.call("GET", "/v1/me", session["token"]))[0].status, 401)
+        self.assertEqual((await self.call("GET", "/v1/me", self.token))[0].status, 200)
+
+    async def test_session_migration_preserves_only_active_tokens_and_is_idempotent(self):
+        now = int(time.time())
+        member, _ = await self.approved()
+        self.db.execute("DELETE FROM sessions")
+        self.db.execute("DELETE FROM metadata WHERE key='persistent_sessions_v1'")
+        user_id = self.owner["user"]["id"]
+        for label, expires in (("valid", now + 1000), ("expired", now - 1), ("boundary", now), ("zero", 0), ("negative", -1)):
+            self.db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (sha(label), user_id, self.org, expires))
+        self.db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (sha("suspended"), member["user_id"], self.org, now + 1000))
+        self.db.execute("UPDATE memberships SET status='suspended' WHERE id=?", (member["id"],))
+        untouched = {table: [tuple(r) for r in self.db.all("SELECT * FROM " + table)]
+                     for table in ("users", "organizations", "memberships", "personal_states", "organization_states")}
+        with patch("server.time.time", return_value=now):
+            self.db.migrate_persistent_sessions()
+        rows = [tuple(r) for r in self.db.all("SELECT * FROM sessions")]
+        self.assertEqual(rows, [(sha("valid"), user_id, self.org, 0)])
+        self.assertEqual(self.db.one("SELECT value FROM metadata WHERE key='persistent_sessions_v1'")["value"], "1")
+        for table, before in untouched.items():
+            self.assertEqual([tuple(r) for r in self.db.all("SELECT * FROM " + table)], before)
+        # Reapproval and restarts cannot restore removed tokens. A future finite
+        # token from an older server version can be migrated without reissuing it.
+        self.db.execute("UPDATE memberships SET status='approved' WHERE id=?", (member["id"],))
+        self.db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (sha("legacy"), user_id, self.org, now + 1000))
+        self.db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (sha("stale"), user_id, self.org, now - 1))
+        self.db.migrate_persistent_sessions()
+        self.db.migrate_persistent_sessions()
+        self.assertEqual({r["token_hash"] for r in self.db.all("SELECT * FROM sessions")}, {sha("valid"), sha("legacy")})
+        self.assertTrue(all(r["expires_at"] == 0 for r in self.db.all("SELECT * FROM sessions")))
+        self.db.execute("UPDATE metadata SET value='unknown' WHERE key='persistent_sessions_v1'")
+        with self.assertRaisesRegex(RuntimeError, "Unsupported session policy"):
+            self.db.migrate_persistent_sessions()
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM sessions")["n"], 2)
+
+    async def test_expired_legacy_cleanup_keeps_persistent_sessions(self):
+        self.db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (sha("stale"), self.owner["user"]["id"], self.org, int(time.time()) - 1))
+        await self.login("owner")
+        self.assertIsNone(self.db.one("SELECT 1 FROM sessions WHERE token_hash=?", (sha("stale"),)))
+        self.assertIsNotNone(self.db.one("SELECT 1 FROM sessions WHERE token_hash=?", (sha(self.token),)))
+
+    async def test_password_reset_revokes_persistent_and_inflight_old_password_login(self):
+        entered, resume = asyncio.Event(), asyncio.Event()
+        original = self.service.verify_password
+
+        async def delayed_verify(encoded, secret):
+            valid = await original(encoded, secret)
+            entered.set()
+            await resume.wait()
+            return valid
+
+        with patch.object(self.service, "verify_password", delayed_verify):
+            pending = asyncio.create_task(self.login("owner"))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                new_hash = await self.service.hash_password(PASSWORD + "-changed")
+                with self.db.transaction():
+                    self.db.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, self.owner["user"]["id"]))
+                    self.db.execute("DELETE FROM sessions WHERE user_id=?", (self.owner["user"]["id"],))
+            finally:
+                resume.set()
+            response, _ = await asyncio.wait_for(pending, 5)
+        self.assertEqual(response.status, 401)
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM sessions")["n"], 0)
+        self.assertEqual((await self.call("GET", "/v1/me", self.token))[0].status, 401)
+
     async def test_organization_rename_preserves_stable_id_and_session(self):
-        response, renamed = await self.call("PATCH", "/v1/organization", self.token, {"name": "Example Team 新名"})
+        response, renamed = await self.call("PATCH", "/v1/organization", self.token, {"name": "Example Org 新名"})
         self.assertEqual(response.status, 200)
         self.assertEqual(renamed["organization"]["id"], self.org)
         _, me = await self.call("GET", "/v1/me", self.token)
-        self.assertEqual(me["organization"]["name"], "Example Team 新名")
-        response, _ = await self.login("owner", "Example Team")
+        self.assertEqual(me["organization"]["name"], "Example Org 新名")
+        response, _ = await self.login("owner", "Example Org")
         self.assertEqual(response.status, 401)
-        response, _ = await self.login("owner", "Example Team 新名")
+        response, _ = await self.login("owner", "Example Org 新名")
         self.assertEqual(response.status, 200)
 
     async def test_rate_limits_and_forwarded_for_is_ignored(self):
         for n in range(10):
-            response, _ = await self.call("POST", "/v1/auth/login", body={"organization": "Example Team", "username": "missing", "password": PASSWORD}, headers={"X-Forwarded-For": f"10.0.0.{n}"})
+            response, _ = await self.call("POST", "/v1/auth/login", body={"organization": "Example Org", "username": "missing", "password": PASSWORD}, headers={"X-Forwarded-For": f"10.0.0.{n}"})
             self.assertEqual(response.status, 401)
-        response, result = await self.call("POST", "/v1/auth/login", body={"organization": "Example Team", "username": "missing", "password": PASSWORD}, headers={"X-Forwarded-For": "10.0.0.99"})
+        response, result = await self.call("POST", "/v1/auth/login", body={"organization": "Example Org", "username": "missing", "password": PASSWORD}, headers={"X-Forwarded-For": "10.0.0.99"})
         self.assertEqual(response.status, 429)
         self.assertEqual(result["error"], "rate_limited")
         self.assertIn("Retry-After", response.headers)
@@ -597,9 +878,9 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         for value in [True, -1, 1.3, "0"]:
             response, _ = await self.call("PUT", "/v1/organization/state", self.token, {"expectedRevision": value, "mutationId": "bad", "document": organization_document()})
             self.assertEqual(response.status, 400)
-        response, error = await self.call("POST", "/v1/auth/login", body={"organization": "Example Team", "username": "owner", "password": "wrong-but-long-password"})
+        response, error = await self.call("POST", "/v1/auth/login", body={"organization": "Example Org", "username": "owner", "password": "wrong-but-long-password"})
         self.assertEqual(response.status, 401)
-        response, unknown = await self.call("POST", "/v1/auth/login", body={"organization": "Example Team", "username": "unknown", "password": PASSWORD})
+        response, unknown = await self.call("POST", "/v1/auth/login", body={"organization": "Example Org", "username": "unknown", "password": PASSWORD})
         self.assertEqual(error, unknown)
         response = await self.client.put("/v1/organization/state", headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}, data='{ "expectedRevision": NaN }')
         self.assertEqual(response.status, 400)

@@ -61,7 +61,7 @@ final class TestCloudBootstrap: CloudBootstrapSource {
         return value
     }
     private func make(_ transport: TestCloudTransport, credentials: TestCloudCredentials = TestCloudCredentials(), bootstrap: TestCloudBootstrap = TestCloudBootstrap()) -> CloudAccount {
-        CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: credentials, bootstrap: bootstrap)
+        CloudAccount(api: CloudAPI(transport: transport), credentials: credentials, bootstrap: bootstrap)
     }
 
     func testUnconfiguredLiveTransportFailsWithoutNetwork() async {
@@ -72,7 +72,7 @@ final class TestCloudBootstrap: CloudBootstrapSource {
     }
     func testHTTPSAndSameOriginAreRequiredBeforeTransport() async throws {
         let transport = TestCloudTransport()
-        let api = CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport)
+        let api = CloudAPI(transport: transport)
         for path in ["https://elsewhere.invalid/v1/me", "//elsewhere.invalid/v1/me", "/api/state", "/v1/me#fragment", "/v1/../secrets", "/v1/%2e%2e/secrets", "/v1/\\evil"] {
             XCTAssertThrowsError(try api.requestURL(path), path)
         }
@@ -84,7 +84,7 @@ final class TestCloudBootstrap: CloudBootstrapSource {
 
     func testRedirectAndUnexpectedCrossOriginResponseAreRejected() async throws {
         let transport = TestCloudTransport()
-        let checked = CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport)
+        let checked = CloudAPI(transport: transport)
         for (status, destination) in [(302, URL(string: "https://cloud.example.invalid/v1/else")), (200, URL(string: "https://other.invalid/v1/me"))] {
             transport.reply(["ok": true], status: status, destination: destination)
             do { _ = try await checked.request("/v1/me", token: "opaque-token"); XCTFail("Must reject redirects") }
@@ -106,6 +106,66 @@ final class TestCloudBootstrap: CloudBootstrapSource {
         let body = try JSONDecoder().decode(JSON.self, from: transport.requests[0].httpBody!)
         XCTAssertEqual(body["organization"], "Example Org"); XCTAssertEqual(body["username"], "owner")
         XCTAssertFalse(String(decoding: try JSONEncoder().encode(credentials.values), as: UTF8.self).contains(password))
+    }
+
+    func testNonExpiringLoginSurvivesCredentialRoundTripAndRestoresAuthorizedAccess() async throws {
+        let transport = TestCloudTransport(), credentials = TestCloudCredentials()
+        var permanentSession = session()
+        permanentSession["expiresAt"] = .null
+        transport.reply(permanentSession)
+        let account = make(transport, credentials: credentials)
+        let loggedIn = await account.login(organization: "Example Org", username: "owner", password: password)
+        XCTAssertTrue(loggedIn)
+        XCTAssertNotNil(account.session)
+        XCTAssertNil(account.session?.expiresAt)
+
+        let stored = try XCTUnwrap(credentials.values[account.api.serverID])
+        let recovered = try JSONDecoder().decode(CloudCredential.self, from: JSONEncoder().encode(stored))
+        XCTAssertEqual(recovered, stored)
+        XCTAssertNotNil(recovered.cachedSession)
+        XCTAssertNil(recovered.cachedSession?.expiresAt)
+        credentials.values[account.api.serverID] = recovered
+
+        var currentSession = session(token: false)
+        currentSession["expiresAt"] = .null
+        transport.reply(currentSession)
+        let restored = make(transport, credentials: credentials)
+        await restored.restoreSession()
+        XCTAssertEqual(restored.identityKey, account.identityKey)
+        XCTAssertNil(restored.session?.expiresAt)
+        transport.reply(["revision": 0, "document": .null])
+        let state = try await restored.authorizedAPI("/v1/organization/state")
+        XCTAssertEqual(state["revision"], .number(0))
+        XCTAssertEqual(transport.requests.map { $0.url?.path }, ["/v1/auth/login", "/v1/me", "/v1/organization/state"])
+        XCTAssertTrue(transport.requests.dropFirst().allSatisfy {
+            $0.value(forHTTPHeaderField: "Authorization") == "Bearer test-only-opaque-token"
+        })
+    }
+
+    func testNonExpiringCachedSessionRestoresOfflineAndStillHonorsServerRevocation() async throws {
+        let transport = TestCloudTransport(), credentials = TestCloudCredentials()
+        let account = make(transport, credentials: credentials)
+        var permanentSession = session(token: false)
+        permanentSession["expiresAt"] = .null
+        let cached = try JSONDecoder().decode(CloudSession.self, from: JSONEncoder().encode(permanentSession))
+        credentials.values[account.api.serverID] = CloudCredential(token: "cached-test-token", userID: "user-one", organizationID: "org-one", cachedSession: cached)
+        transport.failure = URLError(.notConnectedToInternet)
+
+        await account.restoreSession(validateInBackground: true)
+        XCTAssertEqual(account.userID, "user-one")
+        XCTAssertFalse(account.busy)
+        for _ in 0..<100 where account.error == nil { await Task.yield() }
+        XCTAssertTrue(account.message?.contains("离线") == true)
+        XCTAssertNil(account.session?.expiresAt)
+        XCTAssertNotNil(credentials.values[account.api.serverID])
+
+        transport.failure = nil
+        transport.reply(["ok": false, "error": "unauthorized", "message": "会话已撤销"], status: 401)
+        do { _ = try await account.authorizedAPI("/v1/organization/state"); XCTFail("Revocation must also invalidate a non-expiring session") }
+        catch let error as CloudAccountError { XCTAssertEqual(error.code, "unauthorized") }
+        XCTAssertNil(account.session)
+        XCTAssertNil(account.identityKey)
+        XCTAssertNil(credentials.values[account.api.serverID])
     }
 
     func testRegistrationIsPendingAndNeverEstablishesSession() async {
@@ -168,7 +228,7 @@ final class TestCloudBootstrap: CloudBootstrapSource {
 
     func testBackgroundRestoreOpensOwnCacheBeforeNetworkReturnsThenRevokesOn401() async throws {
         let transport = GatedRestoreTransport(), credentials = TestCloudCredentials()
-        let account = CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: credentials, bootstrap: TestCloudBootstrap())
+        let account = CloudAccount(api: CloudAPI(transport: transport), credentials: credentials, bootstrap: TestCloudBootstrap())
         let cached = try JSONDecoder().decode(CloudSession.self, from: JSONEncoder().encode(session(token: false)))
         credentials.values[account.api.serverID] = CloudCredential(token: "cached-test-token", userID: "user-one", organizationID: "org-one", cachedSession: cached)
         await account.restoreSession(validateInBackground: true)
@@ -184,7 +244,7 @@ final class TestCloudBootstrap: CloudBootstrapSource {
 
     func testBackgroundRestoreNetworkFailureKeepsCacheAvailable() async throws {
         let transport = GatedRestoreTransport(), credentials = TestCloudCredentials()
-        let account = CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: credentials, bootstrap: TestCloudBootstrap())
+        let account = CloudAccount(api: CloudAPI(transport: transport), credentials: credentials, bootstrap: TestCloudBootstrap())
         let cached = try JSONDecoder().decode(CloudSession.self, from: JSONEncoder().encode(session(token: false)))
         credentials.values[account.api.serverID] = CloudCredential(token: "cached-test-token", userID: "user-one", organizationID: "org-one", cachedSession: cached)
         await account.restoreSession(validateInBackground: true)
@@ -199,7 +259,7 @@ final class TestCloudBootstrap: CloudBootstrapSource {
 
     func testLateBackgroundVerificationCannotRestoreLoggedOutIdentity() async throws {
         let transport = GatedRestoreTransport(), credentials = TestCloudCredentials()
-        let account = CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: credentials, bootstrap: TestCloudBootstrap())
+        let account = CloudAccount(api: CloudAPI(transport: transport), credentials: credentials, bootstrap: TestCloudBootstrap())
         let cached = try JSONDecoder().decode(CloudSession.self, from: JSONEncoder().encode(session(token: false)))
         credentials.values[account.api.serverID] = CloudCredential(token: "cached-test-token", userID: "user-one", organizationID: "org-one", cachedSession: cached)
         await account.restoreSession(validateInBackground: true)

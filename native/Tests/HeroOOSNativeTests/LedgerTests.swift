@@ -36,8 +36,8 @@ final class LedgerTests: XCTestCase {
         XCTAssertEqual(StudioLedger.amountText(Record()), "未填写")
     }
     func testSearchIncludesPeopleCategoriesChannelsAndDetails() {
-        let record = Record(["title": "项目", "contact": "示例联系人甲", "subcategory": "示例校园活动", "sourceChannelOwner": "示例渠道乙", "details": ["定稿版本"]])
-        for query in ["示例联系人甲", "示例校园活动", "示例渠道乙", "定稿版本"] { XCTAssertTrue(StudioLedger.matches(record, query: query)) }
+        let record = Record(["title": "项目", "contact": "周老师", "subcategory": "校园活动", "sourceChannelOwner": "赵先生", "details": ["定稿版本"]])
+        for query in ["周老师", "校园活动", "赵先生", "定稿版本"] { XCTAssertTrue(StudioLedger.matches(record, query: query)) }
         XCTAssertFalse(StudioLedger.matches(record, query: "不存在"))
     }
     @MainActor func testUnscheduledTasksRankAfterExecutableTasks() {

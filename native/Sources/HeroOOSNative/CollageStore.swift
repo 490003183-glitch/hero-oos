@@ -53,6 +53,7 @@ enum CollageMerge {
     @Published var dirty = false
     @Published var saving = false
     @Published var importing = false
+    @Published var changingLocation = false
     @Published var hasConflict = false
     @Published var message = "正在加载"
     @Published var error: String?
@@ -93,6 +94,49 @@ enum CollageMerge {
             document = response["collages"]; baseline = document; message = "已同步"; error = nil
             surface?.retryMissingImages(); surface?.restoreViewportIfNeeded()
         } catch { self.error = error.localizedDescription; message = "加载失败" }
+    }
+    func chooseLocation(useExisting: Bool) {
+        guard !changingLocation, !importing, !saving else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = !useExisting
+        panel.title = useExisting ? "选择已有拼图文件夹" : "选择拼图保存文件夹"
+        panel.prompt = "选择"
+        guard panel.runModal() == .OK, let target = panel.url else { return }
+        changingLocation = true
+        Task {
+            defer { changingLocation = false }
+            guard await save() else { return }
+            do {
+                let runtime = api.runtime
+                let move = try await Task.detached(priority: .userInitiated) { try runtime.setCollageDirectory(target, useExisting: useExisting) }.value
+                surface?.resetImageCache()
+                history = []; future = []; selection = []
+                await load()
+                if error == nil {
+                    message = "拼图位置已保存"
+                    if let move {
+                        let alert = NSAlert()
+                        alert.messageText = "拼图已转移完成"
+                        alert.informativeText = "画布和图片已复制并校验。是否保留原位置的拼图文件？选择删除会将原文件移到废纸篓。\n\n原位置：\(move.source.path)"
+                        let keepButton = alert.addButton(withTitle: "保留原文件")
+                        let deleteButton = alert.addButton(withTitle: "删除原文件")
+                        // Escape must never select deletion.
+                        keepButton.keyEquivalent = "\u{1b}"
+                        deleteButton.keyEquivalent = ""
+                        if alert.runModal() == .alertSecondButtonReturn {
+                            do {
+                                try await Task.detached(priority: .userInitiated) { try runtime.trashOldCollage(move) }.value
+                                message = "拼图已转移，原文件已移到废纸篓"
+                            } catch {
+                                self.error = error.localizedDescription
+                                message = "拼图已转移，原文件处理未完成"
+                            }
+                        }
+                    }
+                }
+            } catch { self.error = error.localizedDescription; message = "拼图位置未更改" }
+        }
     }
     func checkpoint() {
         history.append(document); if history.count > 50 { history.removeFirst() }; future = []
@@ -357,6 +401,13 @@ struct CollageWorkspace: View {
                 .accessibilityLabel("添加文字")
                 tool("arrow.uturn.backward", "撤销", model.undo).disabled(model.history.isEmpty)
                 tool("arrow.uturn.forward", "重做", model.redo).disabled(model.future.isEmpty)
+                Menu {
+                    Button("选择保存位置…") { model.chooseLocation(useExisting: false) }
+                    Button("打开已有拼图文件夹…") { model.chooseLocation(useExisting: true) }
+                    if let directory = try? model.api.runtime.collageDirectory() {
+                        Button("显示当前拼图文件夹") { NSWorkspace.shared.activateFileViewerSelecting([directory]) }
+                    }
+                } label: { Image(systemName: "folder") }.help("拼图存放位置").accessibilityLabel("拼图存放位置")
                 Spacer(minLength: 4)
                 Text(model.message).font(.caption).foregroundStyle(.secondary)
                 tool("arrow.down.to.line", "导出 JPG") { Task { await model.surface?.exportJPG() } }.disabled(model.items.isEmpty)
@@ -384,7 +435,7 @@ struct CollageWorkspace: View {
                 }.frame(minWidth: 300)
                 CollageInspector().frame(minWidth: 210, idealWidth: 235, maxWidth: 290)
             }
-        }
+        }.disabled(model.changingLocation)
     }
     func tool(_ symbol: String, _ title: String, _ action: @escaping () -> Void) -> some View {
         Button(action: action) { Image(systemName: symbol).frame(width: 20, height: 20) }.buttonStyle(.borderless).help(title).accessibilityLabel(title)

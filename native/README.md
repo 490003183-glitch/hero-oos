@@ -37,6 +37,10 @@ open "$HOME/Applications/Hero OOS.app"
 
 `init` 仅在状态不存在时创建空白工作区，已有状态保留。也可直接执行 `native/.build/release/oos-state init --root /path/to/workspace`。CLI 修改任务需要版本号与操作 JSON；运行 CLI 不带参数查看帮助。
 
+## 拼图保存位置
+
+在拼图页面的文件夹菜单中选择保存位置。程序先复制并校验画布与图片，成功切换后询问是否保留原文件；选择删除会将原画布文件和图片目录移到废纸篓。位置按本机工作区记住；也可选择已有拼图文件夹。已有目标文件不会被覆盖，位置不可用时不会自动创建空画布。此功能不提供云端同步，也不合并不同位置的画布。
+
 ## 可选自建云端
 
 默认不配置云服务器，不会连接作者的服务。本机任务、日程、关系图、台账和拼图可独立使用。
@@ -52,7 +56,7 @@ open "$HOME/Applications/Hero OOS.app"
 
 默认没有 Sparkle 更新地址或公钥，自动检查/下载关闭。维护者可以在打包前设置自己的 `SUFeedURL`（HTTPS 目录下的 `appcast.xml`）与 `SUPublicEDKey`；需要自动更新时同时设置 `SUEnableAutomaticChecks`、`SUAutomaticallyUpdate`。更新目录依据应用内的 feed 确定，签名、大小与摘要校验保留。
 
-`scripts/publish-release.py` 只生成本地签名发布目录，不上传文件。使用 Sparkle 官方 `generate_keys` / `sign_update` 和自己的钥匙串账户：
+`scripts/publish-release.py` 只生成本地签名发布目录，不上传文件。使用 Sparkle 官方 `generate_keys` / `sign_update`，明确选择自己的钥匙串账户或受限权限的签名文件：
 
 ```sh
 python3 scripts/publish-release.py \

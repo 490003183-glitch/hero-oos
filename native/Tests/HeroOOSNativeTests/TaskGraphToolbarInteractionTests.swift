@@ -31,7 +31,19 @@ import AppKit
         let controls = descendants(host).filter {
             $0 is NSPopUpButton || String(describing: type(of: $0)).contains("SwiftUIPopupButton")
         }
-        XCTAssertGreaterThanOrEqual(controls.count, 4)
+        if controls.count < 4 {
+            // Some SwiftUI releases draw popups without exposing individual AppKit controls.
+            // Verify the visible toolbar's protected area at four distinct positions instead.
+            let marker = try XCTUnwrap(descendants(host).compactMap { $0 as? DetailProtectedView }
+                .first { $0.bounds.width > 500 && $0.bounds.height < 200 })
+            let visible = marker.bounds.intersection(marker.visibleRect)
+            XCTAssertGreaterThan(visible.width, 40)
+            for fraction in [0.15, 0.35, 0.55, 0.75] {
+                let point = host.convert(NSPoint(x: visible.minX + visible.width * fraction, y: visible.midY), from: marker)
+                XCTAssertFalse(DetailClickPolicy.isBlank(at: point, in: host, hit: host.hitTest(point)))
+                XCTAssertFalse(host.hitTest(point) is DetailProtectedView)
+            }
+        }
         for control in controls {
             for x in [control.bounds.minX + 4, control.bounds.midX, control.bounds.maxX - 4] {
                 let point = host.convert(NSPoint(x: x, y: control.bounds.midY), from: control)

@@ -80,8 +80,8 @@ import AppKit
             surface.mouseDown(with: try event(.leftMouseDown, surface: surface, point: CGPoint(x: 130, y: 44), count: 2))
             surface.mouseDragged(with: try event(.leftMouseDragged, surface: surface, point: CGPoint(x: 155, y: 69), count: 2))
             surface.mouseUp(with: try event(.leftMouseUp, surface: surface, point: CGPoint(x: 155, y: 69), count: 2))
-            XCTAssertEqual(opened, 0); XCTAssertEqual(graph.layout.positions["a"]?.x, 25)
-            XCTAssertEqual(graph.layout.positions["a"]?.y, 25)
+            XCTAssertEqual(opened, 0); XCTAssertEqual(graph.layout.positions["a"]?.x, 24)
+            XCTAssertEqual(graph.layout.positions["a"]?.y, 24)
             XCTAssertFalse(surface.subviews.contains { $0 is NSTextField })
             XCTAssertEqual(store.state, source); XCTAssertTrue(store.pending.isEmpty)
         }

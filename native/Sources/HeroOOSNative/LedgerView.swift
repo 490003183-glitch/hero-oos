@@ -8,12 +8,17 @@ struct LedgerView: View {
     @AppStorage private var category: String
     @AppStorage private var delivery: String
     @AppStorage private var invoice: String
+    @AppStorage private var summaryExpanded: Bool
+    @AppStorage private var summaryScope: String
+    @State private var summaryFocus: LedgerSummaryFocus?
     init(selected: Binding<String?>, search: String, workspaceIdentity: String) {
         _selected = selected; self.search = search
         _kind = AppStorage(wrappedValue: "all", WorkspaceViewState.preferenceKey("ledger.kind", identity: workspaceIdentity))
         _category = AppStorage(wrappedValue: "all", WorkspaceViewState.preferenceKey("ledger.category", identity: workspaceIdentity))
         _delivery = AppStorage(wrappedValue: "all", WorkspaceViewState.preferenceKey("ledger.delivery", identity: workspaceIdentity))
         _invoice = AppStorage(wrappedValue: "all", WorkspaceViewState.preferenceKey("ledger.invoice", identity: workspaceIdentity))
+        _summaryExpanded = AppStorage(wrappedValue: true, WorkspaceViewState.preferenceKey("ledger.summaryExpanded", identity: workspaceIdentity))
+        _summaryScope = AppStorage(wrappedValue: "all", WorkspaceViewState.preferenceKey("ledger.summaryScope", identity: workspaceIdentity))
     }
     private var records: [Record] { store.tasks.filter(StudioLedger.contains) }
     private func values(_ key: String) -> [String] {
@@ -28,6 +33,49 @@ struct LedgerView: View {
         }.sorted { $0.text("ledgerID").localizedStandardCompare($1.text("ledgerID")) == .orderedAscending }
     }
     var body: some View {
+        let summary = StudioLedgerSummary(tasks: store.tasks, scopeIDs: summaryScope == "filtered" ? Set(filtered.map(\.id)) : nil)
+        let visible = summaryFocus.map { focus in
+            let ids = focus.taskIDs(in: summary)
+            return records.filter { ids.contains($0.id) }.sorted { $0.text("ledgerID").localizedStandardCompare($1.text("ledgerID")) == .orderedAscending }
+        } ?? filtered
+        GeometryReader { geometry in
+            let inlineSidebar = LedgerSummaryLayout.isInline(width: geometry.size.width)
+            HStack(spacing: 0) {
+                tableWorkspace(visible: visible)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if summaryExpanded && inlineSidebar {
+                    Divider()
+                    summaryPanel(summary).frame(width: LedgerSummaryLayout.sidebarWidth)
+                }
+            }
+            .overlay(alignment: .trailing) {
+                if summaryExpanded && !inlineSidebar {
+                    summaryPanel(summary)
+                        .frame(width: min(LedgerSummaryLayout.sidebarWidth, geometry.size.width))
+                        .background(.background)
+                        .shadow(color: .black.opacity(0.2), radius: 12, x: -5)
+                        .overlay(alignment: .leading) { Divider() }
+                }
+            }
+            .onChange(of: summaryFocus) { _, focus in
+                if focus != nil && !inlineSidebar { summaryExpanded = false }
+            }
+        }
+        .onChange(of: kind) { _, _ in summaryFocus = nil }
+        .onChange(of: category) { _, _ in summaryFocus = nil }
+        .onChange(of: delivery) { _, _ in summaryFocus = nil }
+        .onChange(of: invoice) { _, _ in summaryFocus = nil }
+        .onChange(of: search) { _, _ in summaryFocus = nil }
+        .onChange(of: summaryScope) { _, _ in summaryFocus = nil }
+    }
+    private func summaryPanel(_ summary: StudioLedgerSummary) -> some View {
+        LedgerSummarySidebar(summary: summary, scope: $summaryScope, focus: $summaryFocus,
+                             close: { summaryExpanded = false })
+            .frame(maxHeight: .infinity)
+            .background(.background)
+            .taskDetailClickTarget()
+    }
+    private func tableWorkspace(visible: [Record]) -> some View {
         VStack(spacing: 0) {
             VStack(spacing: 10) {
                 HStack {
@@ -42,7 +90,7 @@ struct LedgerView: View {
                         }
                     }
                     Spacer(minLength: 0)
-                    Text("\(filtered.count) / \(records.count) 项").font(.caption).foregroundStyle(.secondary)
+                    Text("\(visible.count) / \(records.count) 项").font(.caption).foregroundStyle(.secondary)
                 }
                 HStack {
                     ViewThatFits(in: .horizontal) {
@@ -59,13 +107,28 @@ struct LedgerView: View {
                     Button { kind = "all"; category = "all"; delivery = "all"; invoice = "all" } label: {
                         Image(systemName: "line.3.horizontal.decrease.circle")
                     }.help("清除台账筛选").disabled(kind == "all" && category == "all" && delivery == "all" && invoice == "all")
+                    Button { summaryExpanded.toggle() } label: {
+                        Label("金额统计", systemImage: "sidebar.right")
+                    }
+                    .accessibilityLabel(summaryExpanded ? "收起金额统计" : "展开金额统计")
+                    .help(summaryExpanded ? "收起右侧金额统计" : "展开右侧金额统计")
                 }
-            }.padding(16)
+            }.padding(16).taskDetailClickTarget()
             Divider()
-            if filtered.isEmpty {
+            if let summaryFocus {
+                HStack(spacing: 8) {
+                    Image(systemName: "chart.bar.xaxis").foregroundStyle(Color.accentColor)
+                    Text("统计明细：\(summaryFocus.title)").lineLimit(2)
+                    Spacer(minLength: 4)
+                    Button("返回原筛选") { self.summaryFocus = nil }
+                }
+                .font(.callout).padding(.horizontal, 16).padding(.vertical, 10)
+                .background(Color.accentColor.opacity(0.08)).taskDetailClickTarget()
+            }
+            if visible.isEmpty {
                 ContentUnavailableView("没有匹配的台账记录", systemImage: "tablecells")
             } else {
-                Table(filtered, selection: $selected) {
+                Table(visible, selection: $selected) {
                     TableColumn("项目") { record in
                         VStack(alignment: .leading, spacing: 4) {
                             Text(record.title).fontWeight(record.status == "active" ? .bold : .medium).lineLimit(2)
@@ -81,6 +144,7 @@ struct LedgerView: View {
                     }.width(min: 140, ideal: 185)
                     TableColumn("交付") { Text($0.text("deliveryStatus").isEmpty ? "未填写" : $0.text("deliveryStatus")) }.width(80)
                     TableColumn("开票") { Text($0.text("invoiceStatus").isEmpty ? "未填写" : $0.text("invoiceStatus")) }.width(80)
+                    TableColumn("收款") { Text($0.text("paymentStatus").isEmpty ? "待确认" : $0.text("paymentStatus")) }.width(80)
                     TableColumn("含税金额") { Text(StudioLedger.amountText($0)).monospacedDigit() }.width(90)
                     TableColumn("执行人") { Text($0.text("executor")) }.width(90)
                 }
@@ -120,7 +184,9 @@ struct LedgerInspectorFields: View {
                 TextField("当前待办事项", text: text("nextAction"), axis: .vertical).lineLimit(1...6)
                 LedgerChoice(title: "交付状态", value: text("deliveryStatus"), options: StudioLedger.deliveryStatuses)
                 LedgerChoice(title: "开票状态", value: text("invoiceStatus"), options: StudioLedger.invoiceStatuses)
+                LedgerChoice(title: "收款状态", value: text("paymentStatus"), options: ["未收款", "部分收款", "已收款", "不适用"])
                 AmountField(value: Binding(get: { store.task(id)?["amountTaxInclusive"] ?? .null }, set: { store.edit(id, "amountTaxInclusive", $0) }))
+                TextField("币种（空白按 CNY 人民币）", text: text("currency"))
             }
             if !task["ledgerSource"].object.isEmpty {
                 Section("导入来源") {

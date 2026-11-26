@@ -9,7 +9,7 @@ final class UpdateManagerTests: XCTestCase {
     private let archive = Data("test archive fixture".utf8)
     private func release(build: Int = 22) throws -> PublishedRelease {
         PublishedRelease(version: "1.7.0", build: build, architecture: "arm64", minOS: "15.0", schema: 1,
-                         url: URL(string: "https://cloud.example.invalid/updates/Hero-OOS-build-\(build)-arm64.zip")!,
+                         url: UpdateTrust.root.appendingPathComponent("Hero-OOS-build-\(build)-arm64.zip"),
                          sha256: SHA256.hash(data: archive).map { String(format: "%02x", $0) }.joined(),
                          edSignature: try key.signature(for: archive).base64EncodedString(),
                          byteLength: archive.count, publishedAt: "2026-10-13T00:00:00Z")
@@ -19,10 +19,12 @@ final class UpdateManagerTests: XCTestCase {
         return try UpdateTrust.catalog(data, signature: key.signature(for: data).base64EncodedString(), publicKey: publicKey)
     }
     func testOnlyOwnHTTPSUpdateDirectoryIsAllowed() {
-        XCTAssertTrue(UpdateTrust.permits(URL(string: "https://cloud.example.invalid/updates/versions.json")!))
+        XCTAssertTrue(UpdateTrust.permits(URL(string: "https://cloud.example.invalid/updates/v3/versions.json")!))
         for raw in ["http://cloud.example.invalid/updates/a.zip", "https://example.com/updates/a.zip", "https://cloud.example.invalid/else/a.zip",
-                    "https://cloud.example.invalid:26251/updates/a.zip", "https://root@cloud.example.invalid/updates/a.zip",
-                    "https://cloud.example.invalid/updates/../private", "https://cloud.example.invalid/updates/a.zip?token=x"] {
+                    "https://cloud.example.invalid:8443/updates/a.zip", "https://root@cloud.example.invalid/updates/a.zip",
+                    "https://cloud.example.invalid/updates/../private", "https://cloud.example.invalid/updates/a.zip?token=x",
+                    "https://cloud.example.invalid/updates/versions.json", "https://cloud.example.invalid/updates/v30/a.zip",
+                    "https://cloud.example.invalid/updates/v3/../a.zip", "https://cloud.example.invalid/updates/v3/a.zip?token=x"] {
             XCTAssertFalse(UpdateTrust.permits(URL(string: raw)!), raw)
         }
     }

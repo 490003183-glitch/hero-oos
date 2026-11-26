@@ -162,6 +162,8 @@ enum CanvasGeometry {
         needsDisplay = true
         scheduleViewportSave()
     }
+    private var imageGeneration = 0
+    func resetImageCache() { imageGeneration += 1; loaded.removeAllObjects(); loading.removeAll(); failed.removeAll(); needsDisplay = true }
     func retryMissingImages() { failed = []; needsDisplay = true }
     private func world(_ point: CGPoint) -> CGPoint { CGPoint(x: (point.x - offset.x) / scale, y: (point.y - offset.y) / scale) }
     override func layout() { super.layout(); restoreViewportIfNeeded(); if needsFit && bounds.width > 100 { fit() } }
@@ -207,14 +209,16 @@ enum CanvasGeometry {
         if let image = loaded.object(forKey: file as NSString) { return image }
         guard !loading.contains(file), !failed.contains(file), let api = model?.api else { return nil }
         loading.insert(file)
+        let generation = imageGeneration
         Task { [weak self] in
             do {
                 let data = try await api.assetData(file)
                 guard let source = CGImageSourceCreateWithData(data as CFData, nil),
                       let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 2048, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { throw NativeError.message("图片无法解码") }
+                guard self?.imageGeneration == generation else { return }
                 self?.loaded.setObject(NSImage(cgImage: cg, size: .zero), forKey: file as NSString, cost: cg.width * cg.height * 4)
-            } catch { self?.failed.insert(file) }
-            self?.loading.remove(file); self?.needsDisplay = true
+            } catch { if self?.imageGeneration == generation { self?.failed.insert(file) } }
+            if self?.imageGeneration == generation { self?.loading.remove(file); self?.needsDisplay = true }
         }
         return nil
     }

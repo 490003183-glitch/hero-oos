@@ -17,17 +17,17 @@ import AppKit
     }
 
     func testDefaultAndPeopleChoicesNormalizeCaseWhitespaceAndDeduplicateUnresolvedPeople() {
-        let source = [task("a", waits: [wait(" ALICE "), wait("bob")]),
+        let source = [task("a", waits: [wait(" ALICE "), wait("zhao")]),
                       task("b", waits: [wait("\nalice\t"), wait("OLD", resolved: true)]),
                       task("c")]
         let graph = TaskGraphModel(); graph.reconcile(source)
 
         XCTAssertEqual(graph.personFilter, .all)
-        XCTAssertEqual(graph.blockerPeople, ["alice", "bob"])
+        XCTAssertEqual(graph.blockerPeople, ["alice", "zhao"])
         XCTAssertEqual(ids(graph), ["a", "b", "c"])
         graph.personFilter = .person("alice")
         XCTAssertEqual(ids(graph), ["a", "b"])
-        graph.personFilter = .person("bob")
+        graph.personFilter = .person("zhao")
         XCTAssertEqual(ids(graph), ["a"])
         XCTAssertEqual(graph.tasks, source) // Reading/filtering never normalizes the stored task.
     }
@@ -48,21 +48,21 @@ import AppKit
     }
 
     func testPeopleSearchAndReadinessFiltersIntersect() {
-        let source = [task("invoice", title: "示例甲 已开票", waits: [wait("ALICE")]),
-                      task("recording", title: "示例乙 录音", waits: [wait("alice")]),
-                      task("other", title: "示例甲 已开票", waits: [wait("other")]),
-                      task("ready", title: "示例甲 可开始")]
+        let source = [task("invoice", title: "示例客户 已开票", waits: [wait("ALICE")]),
+                      task("recording", title: "示例项目 录音", waits: [wait("alice")]),
+                      task("other", title: "示例客户 已开票", waits: [wait("other")]),
+                      task("ready", title: "示例客户 可开始")]
         let graph = TaskGraphModel(); graph.reconcile(source)
         graph.personFilter = .person("alice")
 
-        XCTAssertEqual(ids(graph, query: "示例甲"), ["invoice"])
+        XCTAssertEqual(ids(graph, query: "示例客户"), ["invoice"])
         XCTAssertTrue(ids(graph, query: "不存在").isEmpty)
         graph.filter = .blocked
-        XCTAssertEqual(ids(graph, query: "示例甲"), ["invoice"])
+        XCTAssertEqual(ids(graph, query: "示例客户"), ["invoice"])
         graph.filter = .ready
         XCTAssertTrue(ids(graph).isEmpty)
         graph.personFilter = .none
-        XCTAssertEqual(ids(graph, query: "示例甲"), ["ready"])
+        XCTAssertEqual(ids(graph, query: "示例客户"), ["ready"])
     }
 
     func testHistoryVisibilityAlsoScopesPeopleOptionsAndMatches() {
@@ -137,10 +137,10 @@ import AppKit
     }
 
     func testDependencyArrangeMovesOnlyPersonAndSearchMatchesAndResetDoesNotRearrange() {
-        let source = [task("match", title: "示例甲 结算", waits: [wait("alice")]),
-                      task("not-search", title: "示例乙 结算", waits: [wait("alice")]),
-                      task("not-person", title: "示例甲 交付", waits: [wait("other")]),
-                      task("closed", title: "示例甲 历史", status: "completed", waits: [wait("alice")])]
+        let source = [task("match", title: "示例客户 结算", waits: [wait("alice")]),
+                      task("not-search", title: "示例项目 结算", waits: [wait("alice")]),
+                      task("not-person", title: "示例客户 交付", waits: [wait("other")]),
+                      task("closed", title: "示例客户 历史", status: "completed", waits: [wait("alice")])]
         let graph = TaskGraphModel(); graph.reconcile(source)
         for (index, item) in source.enumerated() {
             graph.layout.positions[item.id] = GraphPoint(CGPoint(x: 9000 + index * 500, y: 8000 + index * 400))
@@ -149,7 +149,7 @@ import AppKit
         graph.personFilter = .person("alice")
         let before = graph.layout
 
-        graph.arrange(query: "示例甲")
+        graph.arrange(query: "示例客户")
 
         XCTAssertEqual(graph.layout.positions["match"], GraphPoint(.zero))
         for id in ["not-search", "not-person", "closed"] { XCTAssertEqual(graph.layout.positions[id], before.positions[id]) }

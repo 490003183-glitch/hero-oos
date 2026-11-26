@@ -30,7 +30,11 @@ python3.11 -m venv .venv
 
 ## 认证、组织与权限 API
 
-所有请求/响应均为 JSON。除 health、bootstrap、register、login 外，必须携带 `Authorization: Bearer <opaque-token>`。会话 7 天；只保存 SHA-256，非 JWT。每次请求实时检查用户与该会话组织成员状态、角色，停用或降权即时生效；停用会删除该组织的已有会话，重新批准不会复活旧会话。
+除服务端事件流外，请求和响应均为 JSON。除 health、bootstrap、register、login 和公开更新通知外，必须携带 `Authorization: Bearer <opaque-token>`。有效会话不按时间自动过期；服务端仅保存令牌的 SHA-256。每次请求和事件心跳均检查账号及组织成员状态，退出或停用可撤销会话；密码重置必须同时撤销该账号所有会话。
+
+`GET /v1/events` 是需要认证的任务变更事件流，包含当前组织和私人任务的版本；`GET /v1/update-events` 是公开的版本号提示，不包含任务或账号数据。事件流只作同步提示，客户端下载更新仍须验证签名。反向代理应关闭缓冲并配置足够的读取超时。
+
+升级到永久会话策略时，服务端只迁移仍有效的会话，不恢复已过期或撤销的令牌。旧版服务端不认识永久会话的标记；如果回退，用户需要重新登录。回退时不要用旧数据库覆盖之后产生的业务数据。
 
 用户名全局唯一、大小写不敏感，3–64 位 ASCII 字母数字及 `_ . @ -`，以字母数字开头。密码 12–128 字符，Argon2id 19 MiB / t=2 / p=1，同时仅进行 1 个哈希，进行中及排队认证合计最多 8 个，超过时 429。组织名 1–64 字符，NFC + casefold 唯一。最多 100 个有效账号名额，包括待审、已获准和正常停用保留的账号。首次注册且所有申请都被拒绝的账号不再占名额，但保留原行、ID 和用户名，不能被新注册者复用；批准旧拒绝申请也须在事务内再次检查容量。一个组织拒绝成员不会撤销其在其他组织的批准，也不会释放曾获准账号的私人数据保留名额。容量仍通过原有成员关系计算；数据库 schema 2 只新增组织任务文档表，不修改账号或成员表约束。
 
@@ -52,7 +56,7 @@ python3.11 -m venv .venv
 ```json
 {
   "token": "仅本次响应提供的随机凭据",
-  "expiresAt": "2026-10-20T00:00:00Z",
+  "expiresAt": null,
   "user": {"id": "uuid", "username": "account"},
   "organization": {"id": "稳定组织uuid", "name": "Example Team", "role": "owner"},
   "memberships": [{"id": "稳定组织uuid", "name": "Example Team", "role": "owner", "status": "approved"}]

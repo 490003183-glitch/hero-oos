@@ -42,7 +42,7 @@ private final class TestSyncLocal: CloudSyncLocalStorage {
                          "organization": ["id": "org-one", "name": "Example Org", "role": "owner"],
                          "memberships": [["id": "org-one", "name": "Example Org", "role": "owner", "status": "approved"]],
                          "expiresAt": "2026-12-01T00:00:00Z"])
-        let account = CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: TestCloudCredentials(), bootstrap: TestCloudBootstrap())
+        let account = CloudAccount(api: CloudAPI(transport: transport), credentials: TestCloudCredentials(), bootstrap: TestCloudBootstrap())
         let logged = await account.login(organization: "Example Org", username: "owner", password: "test-only-password-123")
         XCTAssertTrue(logged)
         return account

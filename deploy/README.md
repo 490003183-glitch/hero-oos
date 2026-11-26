@@ -2,6 +2,8 @@
 
 These are portable deployment examples for a dedicated Debian host with Python 3.11+, nginx, systemd and a domain you control. They do not contain a running service, account, token, database, signing key or update package. The API and data constraints are documented in [server/README.md](../server/README.md).
 
+The nginx example disables buffering for the authenticated task event stream and the public update event stream. The service's optional `releaseCatalog` configuration points to a local `versions.json`; the public event reports only its latest build number, and clients must verify signed catalogs before updating.
+
 ## Layout and installation
 
 Use a dedicated non-login `hero-oos` service user. Install `server/server.py`, `server/backup.py`, and `deploy/daily-backup.py` under `/opt/hero-oos`. Create `/opt/hero-oos/venv` with Python 3.11+ and install `server/requirements.lock` into it. Code and dependencies should be administrator-owned and not writable by the service user. The examples assume:

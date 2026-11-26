@@ -71,7 +71,7 @@ final class CloudURLSessionTransport: NSObject, CloudTransport, URLSessionTaskDe
 }
 
 struct CloudAPI {
-    /// No hosted service is bundled. Configure your own HTTPS server explicitly.
+    /// Public builds require an explicitly configured HTTPS server.
     static var configuredURL: URL {
         let value = ProcessInfo.processInfo.environment["HERO_OOS_CLOUD_URL"]
             ?? Bundle.main.object(forInfoDictionaryKey: "HeroOOSCloudURL") as? String
@@ -369,6 +369,31 @@ struct CloudBootstrapFile: CloudBootstrapSource {
             throw error
         }
     }
+    /// A bound request, rather than an exposed token getter, is shared with the SSE transport.
+    func eventRequest(identity: String) throws -> URLRequest {
+        guard identityKey == identity, !identity.isEmpty, let token, session != nil,
+              !token.isEmpty, !token.contains(where: { $0.isWhitespace || $0.isNewline }) else {
+            throw CloudAccountError(code: "unauthorized", message: "请先确认当前云端账号。")
+        }
+        var request = URLRequest(url: try api.requestURL("/v1/events"), cachePolicy: .reloadIgnoringLocalCacheData,
+                                 timeoutInterval: 75)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        return request
+    }
+    func eventRequestIsCurrent(_ request: URLRequest, identity: String) -> Bool {
+        guard identityKey == identity, let token, session != nil,
+              let expected = try? api.requestURL("/v1/events") else { return false }
+        return request.url == expected && request.value(forHTTPHeaderField: "Authorization") == "Bearer \(token)"
+    }
+    func rejectEventRequest(_ request: URLRequest, identity: String, error: Error) {
+        guard eventRequestIsCurrent(request, identity: identity),
+              let code = (error as? CloudAccountError)?.code, ["unauthorized", "forbidden"].contains(code) else { return }
+        credentialGeneration += 1; restoreValidation?.cancel()
+        token = nil; session = nil; members = []
+        try? credentials.remove(serverID: api.serverID)
+    }
     func logout() async {
         _ = await perform {
             let oldToken = token
@@ -378,7 +403,7 @@ struct CloudBootstrapFile: CloudBootstrapSource {
             token = nil; session = nil; members = []
             if let oldToken {
                 do { _ = try await api.request("/v1/auth/logout", method: "POST", token: oldToken) }
-                catch { message = "已从本机退出。服务器暂不可达，旧会话会在到期后失效。"; return }
+            catch { message = "已从本机退出。服务器暂不可达，未能确认服务端会话已撤销。"; return }
             }
             message = "已退出云端账号。本地任务未删除。"
         }

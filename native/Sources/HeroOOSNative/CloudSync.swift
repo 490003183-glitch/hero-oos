@@ -176,6 +176,10 @@ struct CloudSyncRuntime: CloudSyncLocalStorage {
     private let initialBase: JSON?
     private var journal: CloudSyncJournal?
     private var timer: Task<Void, Never>?
+    private var requestedRemoteRevision = 0
+    private var forceReconcile = false
+    private var localWorkRequested = false
+    private var pushConnected: Bool?
     private var stopped = false
     private var transientPhase: CloudSyncPhase?
     private var consecutiveFailures = 0
@@ -183,7 +187,7 @@ struct CloudSyncRuntime: CloudSyncLocalStorage {
 
     var statusLabel: String {
         switch phase {
-        case .notChecked: return "服务端待核对"
+        case .notChecked: return pushConnected == false ? "推送连接重试中" : "服务端待核对"
         case .pending: return "\(pendingCount) 项待同步"
         case .upToDate: return "服务端已同步"
         case .syncing: return "正在同步服务端"
@@ -211,15 +215,6 @@ struct CloudSyncRuntime: CloudSyncLocalStorage {
     func start() async {
         stopped = false
         await synchronize()
-        guard !stopped else { return }
-        timer?.cancel()
-        timer = Task { [weak self] in
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(10)) } catch { return }
-                guard !Task.isCancelled else { return }
-                await self?.automaticTick()
-            }
-        }
     }
     /// 10, 20, 40, 80, 160, 300 seconds; a manual retry need not wait for this timer.
     static func retryDelay(afterFailures failures: Int) -> TimeInterval {
@@ -227,9 +222,56 @@ struct CloudSyncRuntime: CloudSyncLocalStorage {
     }
     func automaticTick() async {
         await refreshLocalStatus()
+        if pendingCount == 0 { localWorkRequested = false }
         guard !paused, !hasConflict, transientPhase != .authenticationRequired,
               nextRetryAt.map({ now() >= $0 }) ?? true else { return }
+        guard pendingCount > 0 || journal?.pending != nil || forceReconcile ||
+              requestedRemoteRevision > (journal?.serverRevision ?? 0) || lastCheckedAt == nil || nextRetryAt != nil else { return }
         await synchronize()
+    }
+    /// Saves trigger uploads; remote-applied saves with no local changes do not issue another GET.
+    func localDidChange() async {
+        await refreshLocalStatus()
+        guard pendingCount > 0 else { return }
+        localWorkRequested = true
+        guard !busy else { return }
+        await automaticTick()
+    }
+    /// Notifications are hints. Existing revision/CAS/three-way merge still validates all contents.
+    func serverChanged(revision: Int, reconnected: Bool = false) async {
+        guard revision >= 0, !stopped, account.identityKey == identity else { return }
+        requestedRemoteRevision = max(requestedRemoteRevision, revision)
+        if reconnected { forceReconcile = true }
+        guard !busy else { return }
+        await automaticTick()
+    }
+    func pushConnectionChanged(connected: Bool, error: Error? = nil) {
+        guard !stopped, account.identityKey == identity else { return }
+        pushConnected = connected
+        if !connected {
+            if let code = (error as? CloudAccountError)?.code, ["unauthorized", "forbidden"].contains(code), let error {
+                recordFailure(error)
+            } else {
+                message = "服务端通知连接中断，正在自动重连；本机编辑照常保存，待发送内容继续排队。"
+            }
+        }
+        updateStatus()
+    }
+    /// Only pending local work or a known missed remote revision gets a retry timer.
+    /// An idle, acknowledged workspace never periodically downloads task documents.
+    private func scheduleWork() {
+        timer?.cancel(); timer = nil
+        guard !stopped, !paused, !hasConflict, transientPhase != .authenticationRequired,
+              pendingCount > 0 || journal?.pending != nil || forceReconcile ||
+              requestedRemoteRevision > (journal?.serverRevision ?? 0) || localWorkRequested || nextRetryAt != nil else { return }
+        let delay = max(0, nextRetryAt?.timeIntervalSince(now()) ?? 0)
+        timer = Task { [weak self] in
+            do { if delay > 0 { try await Task.sleep(for: .seconds(delay)) } }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            self?.timer = nil
+            await self?.automaticTick()
+        }
     }
     private func updateStatus() {
         if transientPhase == .authenticationRequired { phase = .authenticationRequired }
@@ -238,7 +280,7 @@ struct CloudSyncRuntime: CloudSyncLocalStorage {
         else if hasConflict { phase = .conflict }
         else if let transientPhase { phase = transientPhase }
         else if pendingCount > 0 { phase = .pending }
-        else { phase = lastCheckedAt == nil ? .notChecked : .upToDate }
+        else { phase = lastCheckedAt == nil || pushConnected == false ? .notChecked : .upToDate }
     }
     /// Count changed entities, not keystrokes or network requests. Deletions count too.
     static func pendingEntityCount(base: JSON, current: JSON) -> Int {
@@ -283,6 +325,7 @@ struct CloudSyncRuntime: CloudSyncLocalStorage {
             do { if let journal { try persist(journal) } }
             catch { paused = previouslyPaused; throw error }
             nextRetryAt = nil
+            timer?.cancel(); timer = nil
             updateStatus()
             _ = await saveLocal()
             try await updateLocalStatus()
@@ -367,9 +410,9 @@ struct CloudSyncRuntime: CloudSyncLocalStorage {
     }
     func synchronize() async {
         guard !busy, !hasConflict, !stopped, account.identityKey == identity else { return }
-        busy = true; error = nil
+        busy = true; error = nil; forceReconcile = false; localWorkRequested = false
         updateStatus()
-        defer { busy = false; updateStatus() }
+        defer { busy = false; updateStatus(); scheduleWork() }
         do {
             try checkIdentity(); try loadJournal()
             guard await saveLocal() else { throw CloudAccountError(code: "local_unsaved", message: "本机仍有未保存的编辑，云端同步已暂停。") }

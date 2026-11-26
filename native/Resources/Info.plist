@@ -2,39 +2,39 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleName</key>
-	<string>Hero OOS</string>
 	<key>CFBundleDisplayName</key>
 	<string>Hero OOS</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.hero-oos.native</string>
 	<key>CFBundleExecutable</key>
 	<string>HeroOOS</string>
 	<key>CFBundleIconFile</key>
 	<string>HeroOOS</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.hero-oos.native</string>
+	<key>CFBundleName</key>
+	<string>Hero OOS</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.7.10</string>
+	<string>1.7.16</string>
 	<key>CFBundleVersion</key>
-	<string>33</string>
+	<string>39</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<key>SUEnableAutomaticChecks</key>
-	<false/>
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
-	<key>SUVerifyUpdateBeforeExtraction</key>
-	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
+	<key>SUEnableSystemProfiling</key>
+	<false/>
 	<key>SURequireSignedFeed</key>
 	<true/>
 	<key>SUSignedFeedFailureExpirationInterval</key>
 	<integer>0</integer>
-	<key>SUEnableSystemProfiling</key>
-	<false/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
 </dict>
 </plist>

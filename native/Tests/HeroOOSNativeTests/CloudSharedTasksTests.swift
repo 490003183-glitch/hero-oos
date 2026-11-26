@@ -36,7 +36,7 @@ private struct SharedTaskNoBootstrap: CloudBootstrapSource {
          "organization": ["id": .string(org), "name": "Example Org", "role": .string(role)], "memberships": [], "expiresAt": .null]
     }
     private func account(_ transport: SharedTaskTransport, user: String = "me", role: String = "member") async -> CloudAccount {
-        let account = CloudAccount(api: CloudAPI(baseURL: URL(string: "https://cloud.example.invalid")!, transport: transport), credentials: SharedTaskCredentials(), bootstrap: SharedTaskNoBootstrap())
+        let account = CloudAccount(api: CloudAPI(transport: transport), credentials: SharedTaskCredentials(), bootstrap: SharedTaskNoBootstrap())
         transport.reply(session(user: user, role: role))
         let loggedIn = await account.login(organization: "Example Org", username: "test-user", password: "test-only-long-password")
         XCTAssertTrue(loggedIn)

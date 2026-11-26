@@ -562,7 +562,20 @@ struct TaskGraphView: NSViewRepresentable {
             let edge = GraphEdge(from: connection.output ? connection.id : target, to: connection.output ? target : connection.id)
             Task { await graph.link(edge, connected: true, store: store) }
         }
-        if action == "move", moved, let old = beforeDrag { graph.checkpoint(old) }
+        if action == "move", moved, let old = beforeDrag {
+            // Use the final release position even if AppKit coalesced the last
+            // dragged event. The hidden grid is in world coordinates at every zoom.
+            var positions = graph.layout.positions
+            for id in dragIDs {
+                if let start = old.positions[id] {
+                    positions[id] = GraphPoint(CGPoint(x: start.x + p.x - dragStart.x,
+                                                      y: start.y + p.y - dragStart.y))
+                }
+            }
+            let snapped = TaskGraphGeometry.snappedPositions(positions, moving: dragIDs, anchor: downID)
+            if graph.layout.positions != snapped { graph.layout.positions = snapped }
+            graph.checkpoint(old)
+        }
         else if action == "move", !moved, let id = downID, hit(p) == id, graph.selection.count == 1,
                 event.clickCount == 2, event.modifierFlags.intersection([.shift, .command, .control, .option]).isEmpty {
             // Resolve after mouse-up so dragging a title still moves the card.
