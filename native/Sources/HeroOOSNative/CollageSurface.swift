@@ -1,6 +1,48 @@
 import SwiftUI
 import AppKit
 import ImageIO
+import UniformTypeIdentifiers
+
+@MainActor enum CollageClipboard {
+    static let itemsType = NSPasteboard.PasteboardType("com.hero-oos.items")
+
+    // Keep the canvas representation available immediately and add a standard image only
+    // if the clipboard still contains this copy when image conversion finishes.
+    static func copy(_ items: [Record], to pasteboard: NSPasteboard,
+                     loadImage: @escaping (String) async throws -> Data) async -> Bool {
+        guard !items.isEmpty, let data = try? JSONEncoder().encode(items) else { return false }
+        pasteboard.clearContents()
+        guard pasteboard.setData(data, forType: itemsType) else { return false }
+        guard items.count == 1, items[0].text("kind") == "image" else { return true }
+        let changeCount = pasteboard.changeCount
+        do {
+            let original = try await loadImage(items[0].text("assetFile"))
+            let formats = await Task.detached(priority: .userInitiated) { imageFormats(original) }.value
+            guard pasteboard.changeCount == changeCount else { return true }
+            guard let formats else { return false }
+            let item = NSPasteboardItem()
+            guard item.setData(data, forType: itemsType), item.setData(formats.png, forType: .png),
+                  item.setData(formats.tiff, forType: .tiff) else { return false }
+            pasteboard.clearContents()
+            return pasteboard.writeObjects([item])
+        } catch { return pasteboard.changeCount != changeCount }
+    }
+
+    nonisolated private static func imageFormats(_ data: Data) -> (png: Data, tiff: Data)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+        func encode(_ type: UTType) -> Data? {
+            let result = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(result, type.identifier as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(destination, image, properties)
+            guard CGImageDestinationFinalize(destination) else { return nil }
+            return result as Data
+        }
+        guard let png = encode(.png), let tiff = encode(.tiff) else { return nil }
+        return (png, tiff)
+    }
+}
 
 struct CollageView: NSViewRepresentable {
     @Environment(\.pageBackgroundVisible) private var pageBackgroundVisible
@@ -166,6 +208,11 @@ enum CanvasGeometry {
     func resetImageCache() { imageGeneration += 1; loaded.removeAllObjects(); loading.removeAll(); failed.removeAll(); needsDisplay = true }
     func retryMissingImages() { failed = []; needsDisplay = true }
     private func world(_ point: CGPoint) -> CGPoint { CGPoint(x: (point.x - offset.x) / scale, y: (point.y - offset.y) / scale) }
+    private func item(at point: CGPoint) -> Record? {
+        model?.items.reversed().first {
+            CGRect(origin: .zero, size: CanvasGeometry.rect($0).size).contains(CanvasGeometry.local(point, item: $0))
+        }
+    }
     override func layout() { super.layout(); restoreViewportIfNeeded(); if needsFit && bounds.width > 100 { fit() } }
     func fit() {
         guard bounds.width > 100, bounds.height > 100, let model, model.canvas != nil else { return }
@@ -276,9 +323,7 @@ enum CanvasGeometry {
                 handle = i; action = i == 8 ? "rotate" : "resize"; originals = [item.id: item]; return
             }
         }
-        if let item = model.items.reversed().first(where: {
-            CGRect(origin: .zero, size: CanvasGeometry.rect($0).size).contains(CanvasGeometry.local(downWorld, item: $0))
-        }) {
+        if let item = item(at: downWorld) {
             if event.modifierFlags.contains(.shift) {
                 if model.selection.contains(item.id) { model.selection.remove(item.id) } else { model.selection.insert(item.id) }
             } else if !model.selection.contains(item.id) { model.selection = [item.id] }
@@ -291,6 +336,58 @@ enum CanvasGeometry {
         }
         needsDisplay = true
     }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let model, let item = item(at: world(convert(event.locationInWindow, from: nil))),
+              item.text("kind") == "image" else { return nil }
+        window?.makeFirstResponder(self)
+        model.selection = [item.id]
+        needsDisplay = true
+        let locked = item["locked"].bool
+        let menu = NSMenu()
+        func add(_ title: String, _ action: Selector, enabled: Bool = true) {
+            let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            entry.target = self; entry.isEnabled = enabled; menu.addItem(entry)
+        }
+        menu.autoenablesItems = false
+        add("在 Finder 中显示原图文件", #selector(revealSelectedImage))
+        add("复制图片", #selector(copySelectedFromMenu))
+        add("在画布中创建副本", #selector(duplicateSelectedFromMenu))
+        menu.addItem(.separator())
+        add("旋转 90 度", #selector(rotateSelectedFromMenu), enabled: !locked)
+        add("置顶", #selector(bringSelectedToFront), enabled: !locked)
+        add("置底", #selector(sendSelectedToBack), enabled: !locked)
+        add(locked ? "解除锁定" : "锁定", #selector(toggleSelectedLock))
+        menu.addItem(.separator())
+        add("从画布移除", #selector(removeSelectedFromMenu), enabled: !locked)
+        return menu
+    }
+    @objc private func revealSelectedImage() {
+        guard let model, let item = model.selectedItems.first, item.text("kind") == "image" else { return }
+        do {
+            let url = try model.api.runtime.assetURL(item.text("assetFile"))
+            guard FileManager.default.fileExists(atPath: url.path) else { throw NativeError.message("原图文件不存在或拼图目录不可用。") }
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch { model.error = error.localizedDescription }
+    }
+    @objc private func copySelectedFromMenu() { copySelected() }
+    @objc private func duplicateSelectedFromMenu() { model?.duplicate() }
+    @objc private func rotateSelectedFromMenu() {
+        guard let model, let item = model.selectedItems.first else { return }
+        model.updateSelected("rotation", .number(item.number("rotation") + 90))
+    }
+    @objc private func bringSelectedToFront() {
+        guard let model else { return }
+        model.updateSelected("z", .number((model.items.map { $0.number("z") }.max() ?? 0) + 1))
+    }
+    @objc private func sendSelectedToBack() {
+        guard let model else { return }
+        model.updateSelected("z", .number((model.items.map { $0.number("z") }.min() ?? 0) - 1))
+    }
+    @objc private func toggleSelectedLock() {
+        guard let model, let item = model.selectedItems.first else { return }
+        model.updateSelected("locked", .bool(!item["locked"].bool))
+    }
+    @objc private func removeSelectedFromMenu() { model?.deleteSelection() }
     override func mouseDragged(with event: NSEvent) {
         guard let model else { return }
         let point = convert(event.locationInWindow, from: nil), p = world(point)
@@ -350,11 +447,23 @@ enum CanvasGeometry {
         keyDown(with: event); return true
     }
     private func copySelected() {
-        guard let items = model?.selectedItems, !items.isEmpty, let data = try? JSONEncoder().encode(items) else { return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setData(data, forType: .init("com.hero-oos.items"))
+        guard let model, !model.selectedItems.isEmpty else { return }
+        let items = model.selectedItems, api = model.api
+        let isSingleImage = items.count == 1 && items[0].text("kind") == "image"
+        if isSingleImage { model.message = "正在复制图片…" }
+        Task {
+            if !(await CollageClipboard.copy(items, to: .general, loadImage: { try await api.assetData($0) })) {
+                model.error = "画布内容已复制，但图片无法复制到其他应用。请检查原图片是否可用。"
+                if model.message == "正在复制图片…" { model.message = "图片复制未完成" }
+            } else if isSingleImage && model.message == "正在复制图片…" {
+                let copiedItems = NSPasteboard.general.data(forType: CollageClipboard.itemsType).flatMap { try? JSONDecoder().decode([Record].self, from: $0) }
+                model.message = copiedItems == items &&
+                    NSPasteboard.general.data(forType: .png) != nil ? "图片已复制，可粘贴到其他应用" : "剪贴板已更新"
+            }
+        }
     }
     private func pasteImages() {
-        if let data = NSPasteboard.general.data(forType: .init("com.hero-oos.items")), let items = try? JSONDecoder().decode([Record].self, from: data), let model {
+        if let data = NSPasteboard.general.data(forType: CollageClipboard.itemsType), let items = try? JSONDecoder().decode([Record].self, from: data), let model {
             let top = model.items.map { $0.number("z") }.max() ?? 0
             var pasted: [JSON] = []
             for (i, var item) in items.enumerated() { item["id"] = .string("collage-item-\(UUID().uuidString)"); item["x"] = .number(item.number("x") + 40); item["y"] = .number(item.number("y") + 40); item["z"] = .number(top + Double(i) + 1); pasted.append(item.json) }
