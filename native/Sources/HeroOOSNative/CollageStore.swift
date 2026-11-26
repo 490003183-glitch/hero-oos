@@ -450,6 +450,16 @@ struct CollageInspector: View {
     }
     var body: some View {
         Form {
+            if model.selectedItems.count > 1, let bounds = CanvasGeometry.exportBounds(model.selectedItems) {
+                Section("选中内容的导出分辨率") {
+                    Text("\(Int(bounds.width)) × \(Int(bounds.height)) 像素")
+                        .accessibilityLabel("选中内容导出分辨率")
+                        .accessibilityValue("\(Int(bounds.width)) 乘以 \(Int(bounds.height)) 像素")
+                    if bounds.width * bounds.height > 64_000_000 {
+                        Text("超过 JPG 导出的 6400 万像素上限").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
             if let item = selected {
                 Section(model.selection.count > 1 ? "已选 \(model.selection.count) 项" : "所选内容") {
                     if item.text("kind") == "text" {
@@ -483,6 +493,10 @@ struct CollageInspector: View {
                 }
                 if item.text("kind") == "image" {
                     Section("非等比缩放") {
+                        if model.selectedItems.count > 1 {
+                            Text("尺寸显示第一项，调整会应用到所选的未锁定内容。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         ImageDimensionControl(key: "width", title: "宽", value: number("width"))
                         ImageDimensionControl(key: "height", title: "高", value: number("height"))
                     }.disabled(item["locked"].bool)

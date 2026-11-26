@@ -104,6 +104,10 @@ enum CanvasGeometry {
         let xs = points.map(\.x), ys = points.map(\.y)
         return CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
     }
+    static func exportBounds(_ items: [Record]) -> CGRect? {
+        guard let first = items.first else { return nil }
+        return items.dropFirst().reduce(bounds(first)) { $0.union(bounds($1)) }.integral
+    }
 }
 
 @MainActor final class CollageSurface: NSView {
@@ -485,8 +489,7 @@ enum CanvasGeometry {
     func exportJPG() async {
         guard let model else { return }
         let items = model.selection.isEmpty ? model.items : model.selectedItems
-        guard let first = items.first else { return }
-        let content = items.dropFirst().reduce(CanvasGeometry.bounds(first)) { $0.union(CanvasGeometry.bounds($1)) }.integral
+        guard let content = CanvasGeometry.exportBounds(items) else { return }
         guard content.width * content.height <= 64_000_000, content.width > 0, content.height > 0 else { model.error = "导出区域超过 6400 万像素，请缩小导出范围。"; return }
         let panel = NSSavePanel(); panel.allowedContentTypes = [.jpeg]; panel.nameFieldStringValue = "\(model.canvas?.text("name") ?? "拼图").jpg"
         guard panel.runModal() == .OK, let url = panel.url else { return }
